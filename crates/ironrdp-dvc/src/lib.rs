@@ -117,6 +117,12 @@ pub trait DvcProcessor: AsAny + Send {
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>>;
 
     fn close(&mut self, _channel_id: u32) {}
+
+    /// Called on the server side when the client declined the creation of the channel (its
+    /// Create Response PDU carried a failure `status`, for instance because it has no listener
+    /// for that channel name). [`DvcProcessor::start`] is not called, nor
+    /// [`DvcProcessor::close`].
+    fn creation_failed(&mut self, _channel_id: u32, _status: u32) {}
 }
 
 assert_obj_safe!(DvcProcessor);

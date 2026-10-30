@@ -585,6 +585,7 @@ impl SvcProcessor for DrdynvcServer {
                     // declined on every connect, not a fault.
                     debug!(channel_id = ?id, %name, ?status, "DVC channel creation declined by client");
                     c.state = ChannelState::CreationFailed(status.into());
+                    c.processor.creation_failed(id, status.into());
                     return Ok(resp);
                 }
                 c.state = ChannelState::Opened;

@@ -1,9 +1,10 @@
+use crate::dynamic::{DynamicChannelMessage, RawDvcMessage};
 use core::cell::RefCell;
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
 #[cfg(feature = "egfx")]
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
 use std::collections::HashMap;
@@ -1544,6 +1545,8 @@ pub enum ServerEvent {
     Rdpdr(RdpdrServerMessage),
     Rdpeai(RdpeaiServerMessage),
     Echo(EchoServerMessage),
+    /// Dynamic virtual channels opened at run time by the application, see [`crate::dynamic`].
+    DynamicChannel(DynamicChannelMessage),
     SetCredentials(Credentials),
     /// Replace or clear the Server Auto-Reconnect Cookie.
     SetAutoReconnectCookie(Option<rdp::session_info::ServerAutoReconnect>),
@@ -1583,6 +1586,7 @@ impl fmt::Debug for ServerEvent {
             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
             Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
             Self::Echo(..) => f.write_str("Echo(..)"),
+            Self::DynamicChannel(msg) => f.debug_tuple("DynamicChannel").field(msg).finish(),
             Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
             Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
             Self::SetAutoReconnectCookie(None) => f.write_str("SetAutoReconnectCookie(None)"),
@@ -4294,6 +4298,80 @@ impl RdpServer {
                         .write_all(&data)
                         .await
                         .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                ServerEvent::DynamicChannel(msg) => {
+                    let Some(drdynvc) = conn
+                        .static_channels
+                        .get_by_type_mut::<dvc::DrdynvcServer>()
+                        .and_then(|svc| svc.channel_processor_downcast_mut::<dvc::DrdynvcServer>())
+                    else {
+                        warn!("No drdynvc channel, dropping dynamic channel request");
+                        match msg {
+                            DynamicChannelMessage::Open { reply, .. } => {
+                                let _ = reply.send(Err("no drdynvc channel".to_owned()));
+                            }
+                            DynamicChannelMessage::Send { completion, .. } => {
+                                let _ = completion.send(false);
+                            }
+                            DynamicChannelMessage::Close { .. } => {}
+                        }
+                        continue;
+                    };
+
+                    let (messages, completion) = match msg {
+                        DynamicChannelMessage::Open { processor, reply } => {
+                            let reserved = Arc::new(AtomicU32::new(0));
+                            let id = Arc::clone(&reserved);
+                            let created = drdynvc.create_channel_boxed_with(Box::new(move |channel_id| {
+                                id.store(channel_id, Ordering::Relaxed);
+                                processor
+                            }));
+                            match created {
+                                Ok(create) => {
+                                    let _ = reply.send(Ok(reserved.load(Ordering::Relaxed)));
+                                    (vec![create], None)
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error.to_string()));
+                                    continue;
+                                }
+                            }
+                        }
+                        DynamicChannelMessage::Send {
+                            channel_id,
+                            payload,
+                            completion,
+                        } => {
+                            if !drdynvc.is_channel_opened(channel_id) {
+                                let _ = completion.send(false);
+                                continue;
+                            }
+                            let messages = dvc::encode_dvc_messages(
+                                channel_id,
+                                vec![Box::new(RawDvcMessage(payload))],
+                                ChannelFlags::SHOW_PROTOCOL,
+                            )
+                            .map_err(ServerError::encode)?;
+                            (messages, Some(completion))
+                        }
+                        DynamicChannelMessage::Close { channel_id } => match drdynvc.close_channel(channel_id) {
+                            Some(close) => (vec![close], None),
+                            None => continue,
+                        },
+                    };
+
+                    let drdynvc_channel_id = conn
+                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
+                    let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)
+                        .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
+                    if let Some(completion) = completion {
+                        let _ = completion.send(true);
+                    }
                 }
                 ServerEvent::Echo(msg) => match msg {
                     EchoServerMessage::SendRequest { payload } => {

@@ -9,6 +9,7 @@ mod builder;
 mod capabilities;
 mod clipboard;
 mod display;
+pub mod dynamic;
 mod echo;
 mod encoder;
 mod error;
@@ -32,6 +33,7 @@ pub use display::{
     BitmapUpdate, ColorPointer, DesktopSize, DisplayContext, DisplayUpdate, Framebuffer, LargePointer, PixelFormat,
     RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
 };
+pub use dynamic::{DynamicChannelMessage, RawDvcMessage};
 pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoServerMessage};
 #[cfg(all(feature = "__test", feature = "qoiz"))]
 pub use encoder::qoiz::Compressor as QoizCompressor;
