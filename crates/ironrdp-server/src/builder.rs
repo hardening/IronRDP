@@ -11,6 +11,7 @@ use super::display::{DesktopSize, DisplayContext, RdpServerDisplay};
 #[cfg(feature = "egfx")]
 use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use super::multitransport::UdpFlowSource;
 use super::server::{
     ConnectionBinder, ConnectionHandler, ConnectionPolicy, CredentialValidator, RdpServer, RdpServerOptions,
     RdpServerSecurity, StaticChannelFactory,
@@ -65,6 +66,7 @@ pub struct BuilderDone {
     remotefx_quant: Quant,
     remotefx_entropy_coder: Option<EntropyBits>,
     udp_bind_addr: Option<SocketAddr>,
+    udp_flow_source: Option<Arc<dyn UdpFlowSource>>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -180,6 +182,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                udp_flow_source: None,
             },
         }
     }
@@ -216,6 +219,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                udp_flow_source: None,
             },
         }
     }
@@ -471,6 +475,16 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Offer UDP multitransport like [`Self::with_udp_transport`], but take
+    /// each connection's sideband flow from `source` rather than bind a
+    /// socket per connection: for servers that own the listening UDP socket
+    /// and hand each flow to the connection it belongs to. Takes precedence
+    /// over [`Self::with_udp_transport`].
+    pub fn with_udp_flow_source(mut self, source: Arc<dyn UdpFlowSource>) -> Self {
+        self.state.udp_flow_source = Some(source);
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         let mut server = RdpServer::new(
             RdpServerOptions {
@@ -483,6 +497,7 @@ impl RdpServerBuilder<BuilderDone> {
                 remotefx_quant: self.state.remotefx_quant,
                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
                 udp_bind_addr: self.state.udp_bind_addr,
+                udp_flow_source: self.state.udp_flow_source,
             },
             self.state.handler,
             self.state.display,

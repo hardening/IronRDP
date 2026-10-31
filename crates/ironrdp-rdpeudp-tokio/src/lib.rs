@@ -24,7 +24,7 @@ pub use self::ice::{
 pub use self::multitransport::MultitransportBootstrap;
 pub use self::transport::{
     TunnelMessage, UdpAcceptConfig, UdpTlsConfig, UdpTransport, UdpTransportConfig, UdpTransportSender, accept_udp,
-    connect_udp, connect_udp_with_socket,
+    accept_udp_connected, connect_udp, connect_udp_with_socket, security_cookie_hash,
 };
 
 #[cfg(test)]

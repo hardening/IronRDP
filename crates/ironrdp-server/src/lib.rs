@@ -50,6 +50,7 @@ pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
 pub use ironrdp_rdpeusb::io::{CompletionData, DeviceAnnounce, DeviceText, InternalIoControlPacket};
+pub use multitransport::{UdpFlow, UdpFlowSource};
 pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
 pub use rdpeai::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerFactory, RdpeaiServerMessage};
 pub use rdpei::{

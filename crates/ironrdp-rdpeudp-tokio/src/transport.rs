@@ -789,6 +789,43 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     accept_udp_after_initial_datagram(socket, config, recv_buf[..n].to_vec(), client_addr).await
 }
 
+/// Accept a UDP transport connection on a socket the caller has already
+/// received the client's first datagram on.
+///
+/// For servers that demultiplex one listening UDP port themselves: they read
+/// the SYN, pick the connection it belongs to (a version 3 SYN carries the
+/// hash of the security cookie, see [`security_cookie_hash`]), and hand that
+/// connection a socket `connect()`ed to the client, for instance a
+/// `SO_REUSEPORT` socket bound to the listening address. `initial_datagram`
+/// is the SYN, which that socket did not receive itself.
+///
+/// The rest of the sequence is [`accept_udp`]'s, bounded by the same
+/// `accept_timeout`.
+///
+/// # Errors
+///
+/// Returns `UdpTransportError` if the socket is not connected or any phase
+/// of the accept fails.
+pub async fn accept_udp_connected(
+    socket: UdpSocket,
+    initial_datagram: Vec<u8>,
+    config: UdpAcceptConfig,
+) -> Result<UdpTransport, UdpTransportError> {
+    let client_addr = socket
+        .peer_addr()
+        .map_err(|error| UdpTransportError::socket("accept udp connected", error))?;
+    let config_timeout = config.accept_timeout;
+    tokio::time::timeout(
+        config.accept_timeout,
+        accept_udp_after_initial_datagram(socket, config, initial_datagram, client_addr),
+    )
+    .await
+    .map_err(|_| {
+        debug!(timeout = ?config_timeout, "UDP accept timed out");
+        UdpTransportError::handshake_timeout("accept udp connected")
+    })?
+}
+
 #[cfg(feature = "ice")]
 pub(crate) async fn accept_udp_with_datagram_io<S: DatagramIo>(
     socket: S,
@@ -1012,7 +1049,15 @@ where
 /// later. The sans-I/O crate takes the finished hash and stays free of any
 /// cryptographic dependency.
 fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
-    Sha256::digest(tunnel_config.security_cookie).into()
+    security_cookie_hash(&tunnel_config.security_cookie)
+}
+
+/// The `cookieHash` a version 3 client puts in its SYN for this security
+/// cookie: its SHA-256 digest ([MS-RDPEUDP] 2.2.2.9).
+///
+/// [MS-RDPEUDP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeudp/
+pub fn security_cookie_hash(security_cookie: &[u8; ironrdp_rdpemt::SECURITY_COOKIE_LEN]) -> [u8; 32] {
+    Sha256::digest(security_cookie).into()
 }
 
 #[cfg(test)]

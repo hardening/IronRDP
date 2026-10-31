@@ -15,7 +15,7 @@ use ironrdp_rdpemt::{SubHeaderType, TunnelConfig, TunnelSubHeader};
 use ironrdp_rdpeudp::ConnectionConfig;
 use ironrdp_rdpeudp_tokio::{
     MultitransportBootstrap, TunnelMessage, UdpAcceptConfig, UdpTlsConfig, UdpTransport, UdpTransportConfig,
-    accept_udp, connect_udp,
+    accept_udp, accept_udp_connected, connect_udp, security_cookie_hash,
 };
 use ironrdp_tls::{CertificateValidation, CertificateValidationCallback};
 use tokio::net::UdpSocket;
@@ -93,6 +93,68 @@ async fn full_stack_loopback_handshake() {
     assert!(server.is_alive());
     client.shutdown().await.expect("client shutdown");
     server.shutdown().await.expect("server shutdown");
+}
+
+/// A server that demultiplexes its listening socket itself: it reads the
+/// version 3 SYN, recognizes the connection by its cookie hash, then accepts
+/// on a socket connected to that client with the SYN handed over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_on_a_connected_socket_with_the_syn_handed_over() {
+    let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind listener");
+    let server_addr = listener.local_addr().expect("listener addr");
+    let tunnel_config = test_tunnel_config();
+
+    let client_handle = tokio::spawn({
+        let tunnel_config = tunnel_config.clone();
+        async move { connect_udp(UdpTransportConfig::new(server_addr, "localhost".into(), tunnel_config)).await }
+    });
+
+    let mut syn = vec![0u8; 9000];
+    let (len, client_addr) = listener.recv_from(&mut syn).await.expect("receive SYN");
+    syn.truncate(len);
+    let datagram: ironrdp_rdpeudp::pdu::V1Datagram = ironrdp_core::decode(&syn).expect("decode SYN");
+    let offered = datagram.syn_data_ex.and_then(|ex| ex.cookie_hash);
+    assert_eq!(offered, Some(security_cookie_hash(&tunnel_config.security_cookie)));
+
+    listener.connect(client_addr).await.expect("connect to client");
+    let server = accept_udp_connected(
+        listener,
+        syn,
+        UdpAcceptConfig {
+            tls_config: test_tls_server_config(),
+            tunnel_config,
+            connection_config: ConnectionConfig::default(),
+            accept_timeout: Duration::from_secs(10),
+        },
+    )
+    .await
+    .expect("server accept_udp_connected");
+    let client = client_handle.await.expect("client join").expect("client connect_udp");
+
+    client.send(vec![0x04, 0x05]).await.expect("client send");
+    let mut server = server;
+    assert_eq!(server.recv().await.expect("server recv"), vec![0x04, 0x05]);
+    client.shutdown().await.expect("client shutdown");
+    server.shutdown().await.expect("server shutdown");
+}
+
+/// A connected socket is required: without a peer there is no client to
+/// answer.
+#[tokio::test(flavor = "current_thread")]
+async fn accept_udp_connected_rejects_an_unconnected_socket() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let result = accept_udp_connected(
+        socket,
+        Vec::new(),
+        UdpAcceptConfig {
+            tls_config: test_tls_server_config(),
+            tunnel_config: test_tunnel_config(),
+            connection_config: ConnectionConfig::default(),
+            accept_timeout: Duration::from_secs(1),
+        },
+    )
+    .await;
+    assert!(result.is_err());
 }
 
 /// Verify the full stack works on the current-thread runtime used by ActiveX workers.

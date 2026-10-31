@@ -47,7 +47,9 @@ use ironrdp_rdpdr::pdu::efs::{
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_rdpdr::{Rdpdr, RdpdrBackend, RdpdrBackendFactory, RdpdrBackendProduct, RdpdrDrive};
-use ironrdp_server::{GfxContext, GfxServerFactory, MAX_FASTPATH_UPDATE_SIZE, ServerEventSender};
+use ironrdp_server::{
+    GfxContext, GfxServerFactory, MAX_FASTPATH_UPDATE_SIZE, ServerEventSender, UdpFlow, UdpFlowSource,
+};
 use ironrdp_testsuite_extra as _;
 use ironrdp_tls::TlsStream;
 use ironrdp_tokio::TokioStream;
@@ -2110,6 +2112,48 @@ async fn client_server_with_display<D, DF, F, Fut, C>(
 /// the tunnel closes under EGFX the server has to end the connection.
 #[tokio::test]
 async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
+    egfx_moves_onto_the_udp_tunnel(false).await;
+}
+
+/// As [`egfx_moves_onto_the_udp_tunnel_with_soft_sync`], with the flow taken
+/// from a [`UdpFlowSource`] that owns the listening socket, rather than a
+/// socket the server binds for the connection.
+#[tokio::test]
+async fn egfx_moves_onto_a_udp_flow_from_the_flow_source() {
+    egfx_moves_onto_the_udp_tunnel(true).await;
+}
+
+/// A [`UdpFlowSource`] owning the listening socket: it hands over the flow
+/// whose SYN carries the hash of the request's cookie, and ignores the rest.
+struct TestUdpFlowSource {
+    listener: StdMutex<Option<std::net::UdpSocket>>,
+}
+
+#[async_trait::async_trait]
+impl UdpFlowSource for TestUdpFlowSource {
+    async fn flow(&self, _request_id: u32, security_cookie: [u8; 16]) -> Option<UdpFlow> {
+        let listener = self.listener.lock().expect("listener lock").take()?;
+        let socket = tokio::net::UdpSocket::from_std(listener).expect("register the listener");
+        let expected = ironrdp_rdpeudp_tokio::security_cookie_hash(&security_cookie);
+        let mut buf = vec![0u8; 9000];
+        loop {
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("receive on the listener");
+            let Ok(datagram) = ironrdp_core::decode::<ironrdp_rdpeudp::pdu::V1Datagram>(&buf[..len]) else {
+                continue;
+            };
+            if datagram.syn_data_ex.and_then(|ex| ex.cookie_hash) != Some(expected) {
+                continue;
+            }
+            socket.connect(peer).await.expect("connect to the client");
+            return Some(UdpFlow {
+                socket,
+                initial_datagram: buf[..len].to_vec(),
+            });
+        }
+    }
+}
+
+async fn egfx_moves_onto_the_udp_tunnel(flow_source: bool) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
@@ -2129,7 +2173,7 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
 
     let (caps_tx, mut caps_rx) = mpsc::unbounded_channel();
     let (_display_tx, display_rx) = mpsc::unbounded_channel();
-    let mut server = RdpServer::builder()
+    let builder = RdpServer::builder()
         .with_addr(([127, 0, 0, 1], 0))
         .with_tls(acceptor)
         .with_input_handler(TestInputHandler)
@@ -2137,9 +2181,17 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
             rx: Arc::new(Mutex::new(display_rx)),
             offers_display_control: true,
         })
-        .with_gfx_factory(Some(Box::new(TestGfxFactory { caps_tx })))
-        .with_udp_transport(udp_addr)
-        .build();
+        .with_gfx_factory(Some(Box::new(TestGfxFactory { caps_tx })));
+    let builder = if flow_source {
+        let listener = std::net::UdpSocket::bind(udp_addr).expect("bind the UDP listener");
+        listener.set_nonblocking(true).expect("non-blocking listener");
+        builder.with_udp_flow_source(Arc::new(TestUdpFlowSource {
+            listener: StdMutex::new(Some(listener)),
+        }))
+    } else {
+        builder.with_udp_transport(udp_addr)
+    };
+    let mut server = builder.build();
     server.set_credentials(Some(server::Credentials {
         username: USERNAME.into(),
         password: PASSWORD.into(),

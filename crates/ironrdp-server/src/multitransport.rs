@@ -14,9 +14,12 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_rdpemt::SECURITY_COOKIE_LEN;
 use ironrdp_rdpemt::TunnelConfig;
 use ironrdp_rdpeudp::ConnectionConfig;
-use ironrdp_rdpeudp_tokio::{TunnelMessage, UdpAcceptConfig, UdpTransport, UdpTransportSender, accept_udp};
+use ironrdp_rdpeudp_tokio::{
+    TunnelMessage, UdpAcceptConfig, UdpTransport, UdpTransportSender, accept_udp, accept_udp_connected,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls;
@@ -26,6 +29,48 @@ use tracing::{debug, warn};
 /// handshake, TLS, RDPEMT tunnel creation) may take before giving up and
 /// continuing TCP-only.
 const UDP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The client's sideband UDP flow, as found by a [`UdpFlowSource`].
+pub struct UdpFlow {
+    /// A socket `connect()`ed to the client, for instance a `SO_REUSEPORT`
+    /// socket bound to the listening address.
+    pub socket: UdpSocket,
+    /// The client's first datagram (its SYN), which `socket` did not receive
+    /// itself.
+    pub initial_datagram: Vec<u8>,
+}
+
+/// Finds a connection's sideband UDP flow, for servers that own the listening
+/// UDP socket and demultiplex it themselves rather than bind one socket per
+/// connection (see [`RdpServerBuilder::with_udp_flow_source`](crate::RdpServerBuilder::with_udp_flow_source)).
+///
+/// A version 3 client (MS-RDPEUDP2) puts the SHA-256 digest of the security
+/// cookie in its SYN ([MS-RDPEUDP] 2.2.2.9, see
+/// [`ironrdp_rdpeudp_tokio::security_cookie_hash`]), so the owner of the
+/// listening socket can tell which connection a SYN belongs to before
+/// answering it.
+///
+/// [MS-RDPEUDP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeudp/
+#[async_trait::async_trait]
+pub trait UdpFlowSource: Send + Sync {
+    /// Called when the Initiate Multitransport Request is sent with these
+    /// `request_id` and `security_cookie`. Resolves to the client's flow, or
+    /// `None` when it does not come, in which case the connection continues
+    /// TCP-only.
+    ///
+    /// The whole accept, this wait included, is bounded by a timeout, after
+    /// which the future is dropped.
+    async fn flow(&self, request_id: u32, security_cookie: [u8; SECURITY_COOKIE_LEN]) -> Option<UdpFlow>;
+}
+
+/// Where a connection's sideband UDP flow comes from.
+#[derive(Clone)]
+pub(crate) enum UdpSideband {
+    /// A fresh socket bound to this address per connection.
+    Bind(SocketAddr),
+    /// The application's [`UdpFlowSource`].
+    Source(Arc<dyn UdpFlowSource>),
+}
 
 /// Shared handle to an established sideband UDP transport.
 ///
@@ -96,34 +141,26 @@ pub(crate) fn sideband_bind_addr(bind: SocketAddr, connection_local: Option<Sock
 /// Attempts to establish the sideband UDP transport for one Initiate
 /// Multitransport Request.
 ///
-/// Binds a fresh socket to `udp_bind_addr` for this attempt, avoiding any
-/// shared, long-lived UDP socket state to manage. This assumes at most one
-/// live attempt at a time; under
+/// With [`UdpSideband::Bind`], binds a fresh socket for this attempt, avoiding
+/// any shared, long-lived UDP socket state to manage. This assumes at most
+/// one live attempt at a time; under
 /// [`RdpServerOptions::preempt_existing_session`](crate::server::RdpServerOptions::preempt_existing_session)
 /// a candidate session's negotiation can overlap the still-live session it
-/// is preempting, and `udp_bind_addr` is typically the same host and port for
+/// is preempting, and the bind address is typically the same host and port for
 /// both (see [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport)),
 /// so the second bind fails with `AddrInUse`. That failure is handled below
 /// like any other: The overlapping connection degrades to TCP-only rather
-/// than failing.
+/// than failing. [`UdpSideband::Source`] has no such limit.
 ///
 /// Any failure (bind, RDPEUDP2 handshake, TLS, RDPEMT tunnel) is logged and
 /// reported as `None` rather than propagated: An optional sideband transport
 /// failing to come up is never a reason to fail the RDP connection, matching
 /// the reference client implementation's posture.
 pub(crate) async fn accept(
-    udp_bind_addr: SocketAddr,
+    sideband: UdpSideband,
     tls_config: Arc<rustls::ServerConfig>,
     request: &MultitransportRequestPdu,
 ) -> Option<UdpTransportHandle> {
-    let socket = match UdpSocket::bind(udp_bind_addr).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            warn!(%error, %udp_bind_addr, "Failed to bind UDP socket for multitransport, continuing TCP-only");
-            return None;
-        }
-    };
-
     let config = UdpAcceptConfig {
         tls_config,
         tunnel_config: TunnelConfig {
@@ -134,7 +171,42 @@ pub(crate) async fn accept(
         accept_timeout: UDP_ACCEPT_TIMEOUT,
     };
 
-    match accept_udp(socket, config).await {
+    let result = match sideband {
+        UdpSideband::Bind(udp_bind_addr) => {
+            let socket = match UdpSocket::bind(udp_bind_addr).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    warn!(%error, %udp_bind_addr, "Failed to bind UDP socket for multitransport, continuing TCP-only");
+                    return None;
+                }
+            };
+            accept_udp(socket, config).await
+        }
+        UdpSideband::Source(source) => {
+            // The wait for the flow shares the accept's own budget.
+            let started = tokio::time::Instant::now();
+            let flow = tokio::time::timeout(
+                UDP_ACCEPT_TIMEOUT,
+                source.flow(request.request_id, request.security_cookie),
+            )
+            .await;
+            let Ok(Some(UdpFlow {
+                socket,
+                initial_datagram,
+            })) = flow
+            else {
+                debug!("No UDP flow for the multitransport request, continuing TCP-only");
+                return None;
+            };
+            let config = UdpAcceptConfig {
+                accept_timeout: UDP_ACCEPT_TIMEOUT.saturating_sub(started.elapsed()),
+                ..config
+            };
+            accept_udp_connected(socket, initial_datagram, config).await
+        }
+    };
+
+    match result {
         Ok(transport) => {
             debug!("Sideband UDP transport established");
             Some(UdpTransportHandle::new(transport))
