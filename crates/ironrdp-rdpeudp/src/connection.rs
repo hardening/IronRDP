@@ -1308,30 +1308,76 @@ impl RdpeudpConnection {
     }
 
     /// Server receives the client's final ACK.
-    fn handle_final_ack(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
-        let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
+    ///
+    /// With MS-RDPEUDP2 (version 3), a client can also skip that ACK and go
+    /// straight to the v2 format: FreeRDP does, and Windows servers accept
+    /// it. Its first v2 data packet then completes the handshake. A v2 packet can
+    /// pass for a v1 datagram, so on a v2 connection a v1 SYN or ACK only
+    /// counts as one when it carries the handshake's sequence numbers.
+    fn handle_final_ack(&mut self, wire: &mut [u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
+        let v2 = !self.wire_is_v1();
+        let (local_isn, remote_isn) = self
+            .params
+            .as_ref()
+            .map(|p| (p.local_isn, p.remote_isn))
+            .unwrap_or_default();
 
-        // The client repeats its SYN when our SYN+ACK goes missing. Answer it
-        // again rather than reading it as a protocol violation.
-        if datagram.header.flags.contains(V1Flags::SYN) {
-            debug!("Client repeated SYN, resending SYN+ACK");
-            self.resend_handshake_datagram();
-            return Ok(());
+        let datagram = decode::<V1Datagram>(wire);
+        if let Ok(datagram) = &datagram {
+            // The client repeats its SYN when our SYN+ACK goes missing. Answer it
+            // again rather than reading it as a protocol violation.
+            let syn = datagram.header.flags.contains(V1Flags::SYN)
+                && (!v2
+                    || datagram
+                        .syn_data
+                        .is_some_and(|syn_data| syn_data.initial_sequence_number == remote_isn));
+            if syn {
+                debug!("Client repeated SYN, resending SYN+ACK");
+                self.resend_handshake_datagram();
+                return Ok(());
+            }
+
+            let ack = datagram.header.flags.contains(V1Flags::ACK)
+                && !datagram.header.flags.contains(V1Flags::SYN)
+                && (!v2 || datagram.header.sn_source_ack == local_isn);
+            if ack {
+                debug!("Received final ACK");
+                self.sample_handshake_rtt(now);
+                self.transition_to_established(now);
+                return Ok(());
+            }
         }
 
-        if !datagram.header.flags.contains(V1Flags::ACK) {
-            return Err(RdpeudpError::invalid_packet(
-                "handle final ACK",
-                "expected ACK during handshake",
-            ));
+        if v2 && Self::is_first_v2_data_packet(wire) {
+            debug!("First v2 data packet completes the handshake");
+            self.sample_handshake_rtt(now);
+            self.transition_to_established(now);
+            return self.handle_v2_packet(wire, now);
         }
 
-        debug!("Received final ACK");
+        datagram.map_err(RdpeudpError::decode)?;
+        Err(RdpeudpError::invalid_packet(
+            "handle final ACK",
+            "expected ACK during handshake",
+        ))
+    }
 
-        self.sample_handshake_rtt(now);
-
-        self.transition_to_established(now);
-        Ok(())
+    /// Whether `wire` is the client's first v2 data packet: it carries data
+    /// on channel sequence number 1, where MS-RDPEUDP2 numbering starts.
+    /// Short v1 datagrams can decode as v2 packets too, that is what rules
+    /// them out. `wire` is left as it is (`decode_with_prefix` swaps bytes in
+    /// place).
+    fn is_first_v2_data_packet(wire: &[u8]) -> bool {
+        let mut copy = wire.to_vec();
+        let Ok((_, packet_bytes)) = decode_with_prefix(&mut copy) else {
+            return false;
+        };
+        decode::<V2Packet>(packet_bytes).is_ok_and(|packet| {
+            packet.data_header.is_some()
+                && packet
+                    .data_body
+                    .is_some_and(|body| body.channel_seq_num == 1 && !body.data.is_empty())
+        })
     }
 
     /// Build and enqueue the client's final ACK.

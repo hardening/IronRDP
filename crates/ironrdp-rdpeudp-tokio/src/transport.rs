@@ -582,6 +582,7 @@ pub(crate) async fn connect_udp_with_datagram_io<S: DatagramIo>(
 
     let mut connection_config = config.connection_config;
     connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
+    randomize_initial_sequence_number(&mut connection_config);
 
     let conn = RdpeudpConnection::connect(connection_config, Clock::new().now()).map_err(|error| {
         UdpTransportError::handshake("connect UDP", DriverError::rdpeudp("build RDP-UDP connection", error))
@@ -874,6 +875,7 @@ async fn accept_udp_after_initial_datagram<S: DatagramIo>(
 
     let mut connection_config = config.connection_config;
     connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
+    randomize_initial_sequence_number(&mut connection_config);
 
     let conn = RdpeudpConnection::accept(connection_config, &syn_datagram, Clock::new().now()).map_err(|error| {
         warn!(%error, peer = %client_addr, "Rejected initial SYN datagram");
@@ -1052,12 +1054,41 @@ fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
     security_cookie_hash(&tunnel_config.security_cookie)
 }
 
+/// Draws the `snInitialSequenceNumber` of our SYN or SYN+ACK at random
+/// ([MS-RDPEUDP] 3.1.5.1.1), unless the caller chose one: the peer checks
+/// that the answer acknowledges it, so a third party that spoofs our address
+/// has to guess it. The randomness comes from the rustls crypto provider,
+/// which has to be installed for the tunnel's TLS anyway.
+///
+/// [MS-RDPEUDP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeudp/
+fn randomize_initial_sequence_number(config: &mut ConnectionConfig) {
+    if config.initial_sequence_number != 0 {
+        return;
+    }
+    let Some(provider) = tokio_rustls::rustls::crypto::CryptoProvider::get_default() else {
+        return;
+    };
+    let mut isn = [0u8; 4];
+    if provider.secure_random.fill(&mut isn).is_ok() {
+        config.initial_sequence_number = u32::from_le_bytes(isn);
+    }
+}
+
 /// The `cookieHash` a version 3 client puts in its SYN for this security
-/// cookie: its SHA-256 digest ([MS-RDPEUDP] 2.2.2.9).
+/// cookie: its SHA-256 digest ([MS-RDPEUDP] 2.2.2.9), with each 32-bit word
+/// byte swapped.
+///
+/// The specification only says SHA-256; the swapped form is the one Windows
+/// accepts, and the one FreeRDP sends. With the plain digest, a Windows or
+/// FreeRDP peer does not match it and the connection falls back to version 2.
 ///
 /// [MS-RDPEUDP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeudp/
 pub fn security_cookie_hash(security_cookie: &[u8; ironrdp_rdpemt::SECURITY_COOKIE_LEN]) -> [u8; 32] {
-    Sha256::digest(security_cookie).into()
+    let mut hash: [u8; 32] = Sha256::digest(security_cookie).into();
+    for word in hash.chunks_exact_mut(4) {
+        word.reverse();
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -1363,5 +1394,13 @@ mod tests {
             encode(message(250)).is_err(),
             "the encoder refuses what the precheck refuses"
         );
+    }
+
+    #[test]
+    fn the_cookie_hash_has_its_words_swapped() {
+        // SHA-256 of 16 zero bytes is 374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb
+        let hash = security_cookie_hash(&[0; ironrdp_rdpemt::SECURITY_COOKIE_LEN]);
+        assert_eq!(&hash[..8], &[0xff, 0x08, 0x47, 0x37, 0xd5, 0x9d, 0x71, 0xf7]);
+        assert_eq!(&hash[28..], &[0xbb, 0x37, 0xec, 0x28]);
     }
 }

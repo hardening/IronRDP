@@ -384,6 +384,61 @@ fn a_retransmitted_syn_skips_the_handshake_rtt_sample() {
     assert_eq!(client.srtt(), None, "an ambiguous answer must not seed a sample");
 }
 
+/// A version 3 client can skip the final ACK and go straight to the v2
+/// format, as FreeRDP does: its first data packet completes the server's
+/// handshake, and its payload is delivered.
+#[test]
+fn the_first_v2_packet_completes_the_server_handshake() {
+    let t = now();
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
+    let mut server = RdpeudpConnection::accept(default_config(200), &syn_dg, t).expect("accept");
+    let mut syn_ack = server.poll_transmit(t).expect("SYN+ACK").contents;
+    client
+        .handle_datagram(&mut syn_ack, later(t, 50))
+        .expect("handle SYN+ACK");
+    let _final_ack_not_sent = client.poll_transmit(later(t, 50)).expect("final ACK");
+
+    let payload = vec![0x16, 0x03, 0x01, 0x00, 0xC8];
+    client.send(payload.clone()).expect("send");
+    let mut data = client.poll_transmit(later(t, 60)).expect("data packet").contents;
+    server.handle_datagram(&mut data, later(t, 100)).expect("handle data");
+
+    assert!(server.is_established());
+    assert_eq!(server.poll_event(), Some(Event::Connected));
+    assert_eq!(server.poll_event(), Some(Event::DataReceived(payload)));
+}
+
+/// On a v2 connection, a datagram that is neither the client's v1 ACK of our
+/// SYN+ACK nor a v2 packet leaves the handshake where it is.
+#[test]
+fn a_stray_v1_ack_does_not_complete_a_v2_handshake() {
+    let t = now();
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
+    let mut server = RdpeudpConnection::accept(default_config(200), &syn_dg, t).expect("accept");
+    let _syn_ack = server.poll_transmit(t).expect("SYN+ACK");
+
+    let mut stray = encode_vec(&V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 7,
+            receive_window_size: 64,
+            flags: V1Flags::ACK,
+        },
+        ack_vector: None,
+        ack_of_acks: None,
+        syn_data: None,
+        correlation_id: None,
+        syn_data_ex: None,
+        data: None,
+    })
+    .expect("encode");
+    assert!(server.handle_datagram(&mut stray, later(t, 100)).is_err());
+    assert!(!server.is_established());
+}
+
 #[test]
 fn send_data_after_established() {
     let (mut client, _server, t) = establish_pair();
