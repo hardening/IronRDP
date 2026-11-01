@@ -794,6 +794,20 @@ pub struct RdpServerOptions {
     /// socket bound to `udp_bind_addr`, which it takes precedence over. Set via
     /// [`RdpServerBuilder::with_udp_flow_source`](crate::RdpServerBuilder::with_udp_flow_source).
     pub udp_flow_source: Option<Arc<dyn multitransport::UdpFlowSource>>,
+    /// Where the server side of CredSSP runs, under [`RdpServerSecurity::Hybrid`], instead of in
+    /// the acceptor against the server credentials. Set via
+    /// [`RdpServerBuilder::with_credssp_relay`](crate::RdpServerBuilder::with_credssp_relay).
+    pub credssp_relay: Option<Arc<dyn CredsspRelayFactory>>,
+    /// Under [`RdpServerSecurity::Hybrid`], also accept clients asking for TLS only (their
+    /// credentials then come in ClientInfo). Set via
+    /// [`RdpServerBuilder::with_tls_besides_hybrid`](crate::RdpServerBuilder::with_tls_besides_hybrid).
+    pub tls_besides_hybrid: bool,
+}
+
+/// Gives each connection the [`CredsspRelay`](ironrdp_acceptor::CredsspRelay) running its CredSSP
+/// exchange elsewhere (another process holding the secrets, for instance).
+pub trait CredsspRelayFactory: Send + Sync {
+    fn new_relay(&self) -> Box<dyn ironrdp_acceptor::CredsspRelay>;
 }
 
 impl RdpServerOptions {
@@ -1739,6 +1753,7 @@ enum NegotiatedTransport<S> {
 /// holding the server at all.
 struct PendingConnection {
     security: RdpServerSecurity,
+    credssp_relay: Option<Arc<dyn CredsspRelayFactory>>,
     acceptor: Acceptor,
     credentials_handler: ServerCredentialsHandler,
 }
@@ -1790,6 +1805,10 @@ impl Drop for BoundConnectionGuard {
 }
 
 impl PendingConnection {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the negotiation settings of a connection, from the server options"
+    )]
     fn new(
         security: RdpServerSecurity,
         desktop_size: DesktopSize,
@@ -1797,9 +1816,14 @@ impl PendingConnection {
         creds: Option<Credentials>,
         honor_client_desktop_size: Option<DesktopSize>,
         offer_udp: bool,
+        tls_besides_hybrid: bool,
         credentials_handler: ServerCredentialsHandler,
     ) -> Self {
-        let mut acceptor = Acceptor::new(security.flag(), desktop_size, capabilities, creds);
+        let mut flags = security.flag();
+        if tls_besides_hybrid && matches!(security, RdpServerSecurity::Hybrid(_)) {
+            flags |= nego::SecurityProtocol::SSL;
+        }
+        let mut acceptor = Acceptor::new(flags, desktop_size, capabilities, creds);
         acceptor.set_honor_client_desktop_size(honor_client_desktop_size);
         // Multitransport requires Enhanced Security: `RdpServerSecurity::None`
         // has nothing to authenticate the sideband transport's TLS with, and
@@ -1817,6 +1841,7 @@ impl PendingConnection {
         }
         Self {
             security,
+            credssp_relay: None,
             acceptor,
             credentials_handler,
         }
@@ -1844,9 +1869,11 @@ impl PendingConnection {
     {
         let PendingConnection {
             security,
+            credssp_relay,
             mut acceptor,
             mut credentials_handler,
         } = self;
+        let credssp_relay = credssp_relay.as_deref();
         let security = &security;
         let framed = TokioFramed::new(stream);
 
@@ -1877,7 +1904,14 @@ impl PendingConnection {
                         }
                     };
                     let mut framed = TokioFramed::new(accept);
-                    complete_security_upgrade(security, &mut framed, &mut acceptor, &mut credentials_handler).await?;
+                    complete_security_upgrade(
+                        security,
+                        credssp_relay,
+                        &mut framed,
+                        &mut acceptor,
+                        &mut credentials_handler,
+                    )
+                    .await?;
                     Ok(Some(NegotiatedConnection {
                         transport: NegotiatedTransport::Tls(Box::new(framed)),
                         acceptor,
@@ -1890,7 +1924,14 @@ impl PendingConnection {
                 // tls_acceptor.accept on it.
                 TransportTls::AlreadyDone => {
                     let mut framed = TokioFramed::new(stream);
-                    complete_security_upgrade(security, &mut framed, &mut acceptor, &mut credentials_handler).await?;
+                    complete_security_upgrade(
+                        security,
+                        credssp_relay,
+                        &mut framed,
+                        &mut acceptor,
+                        &mut credentials_handler,
+                    )
+                    .await?;
                     Ok(Some(NegotiatedConnection {
                         transport: NegotiatedTransport::Offloaded(framed),
                         acceptor,
@@ -2060,6 +2101,7 @@ impl ConnectionState {
 /// itself, not bundled into a `&mut self` method.
 async fn complete_security_upgrade<S>(
     security: &RdpServerSecurity,
+    credssp_relay: Option<&dyn CredsspRelayFactory>,
     framed: &mut TokioFramed<S>,
     acceptor: &mut Acceptor,
     credentials_handler: &mut ServerCredentialsHandler,
@@ -2069,7 +2111,12 @@ where
 {
     acceptor.mark_security_upgrade_as_done();
 
-    if let RdpServerSecurity::Hybrid((_, pub_key)) = security {
+    if let (RdpServerSecurity::Hybrid(_), Some(factory)) = (security, credssp_relay) {
+        let mut relay = factory.new_relay();
+        ironrdp_acceptor::accept_credssp_relay(framed, acceptor, relay.as_mut(), credentials_handler)
+            .await
+            .map_err_kind("accept_credssp", ServerErrorKind::Connector)?;
+    } else if let RdpServerSecurity::Hybrid((_, pub_key)) = security {
         // Generic streams don't expose peer address. Use a neutral
         // placeholder; it's unclear whether CredSSP/NTLM actually
         // uses this value in practice.
@@ -2263,19 +2310,21 @@ where
     } = incoming;
     let size = ctx.display.lock().await.size().await;
     let capabilities = capabilities::capabilities(&ctx.opts, size);
-    let pending = PendingConnection::new(
+    let mut pending = PendingConnection::new(
         ctx.opts.security.clone(),
         size,
         capabilities,
         ctx.creds.clone(),
         ctx.opts.honor_client_desktop_size,
         ctx.opts.udp_sideband(None).is_some(),
+        ctx.opts.tls_besides_hybrid,
         ServerCredentialsHandler {
             validator: ctx.credential_validator.clone(),
             require_authenticated: ctx.requires_authenticated_credentials,
             ..ServerCredentialsHandler::default()
         },
     );
+    pending.credssp_relay = ctx.opts.credssp_relay.clone();
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
     // sound / gfx backends means running user-supplied factories for a peer
@@ -3230,19 +3279,21 @@ impl RdpServer {
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
-        let pending = PendingConnection::new(
+        let mut pending = PendingConnection::new(
             self.opts.security.clone(),
             size,
             capabilities,
             self.creds.clone(),
             self.opts.honor_client_desktop_size,
             self.opts.udp_sideband(None).is_some(),
+            self.opts.tls_besides_hybrid,
             ServerCredentialsHandler {
                 validator: self.credential_validator.clone(),
                 require_authenticated: self.connection_binder.is_some(),
                 ..ServerCredentialsHandler::default()
             },
         );
+        pending.credssp_relay = self.opts.credssp_relay.clone();
 
         let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
             return Ok(());
@@ -6740,6 +6791,8 @@ mod preempt_tests {
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
                 udp_flow_source: None,
+                credssp_relay: None,
+                tls_besides_hybrid: false,
             },
             creds: None,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),

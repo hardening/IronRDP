@@ -45,7 +45,10 @@ pub use gfx::{EgfxServerMessage, GfxContext, GfxDvcBridge, GfxServerFactory, Gfx
 pub use handler::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
-pub use ironrdp_acceptor::{Acceptor, CredentialOrigin, ReceivedCredentials};
+pub use ironrdp_acceptor::{
+    Acceptor, ConnectorError, ConnectorErrorExt, ConnectorResult, CredentialOrigin, CredsspRelay, CredsspRelayReply,
+    ReceivedCredentials,
+};
 pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
@@ -59,6 +62,7 @@ pub use rdpei::{
     RdpeiServerFactory, ScReadyFeatures, TouchContact, TouchContactDataFlags, TouchContactFields, TouchContactFlags,
     TouchEventPdu, TouchFrame,
 };
+pub use server::CredsspRelayFactory;
 #[cfg(feature = "__test")]
 pub use server::audio_redirection_wanted;
 #[cfg(feature = "__test")]

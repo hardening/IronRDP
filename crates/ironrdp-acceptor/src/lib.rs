@@ -29,6 +29,37 @@ pub use self::connection::{
 pub use self::credssp::CredsspBackend;
 pub use self::finalization::{FinalizationSequence, FinalizationState};
 use crate::credssp::resolve_generator;
+pub use ironrdp_pdu::rdp::client_info::Credentials;
+
+/// What a [`CredsspRelay`] answers to a TSRequest of the client.
+#[derive(Debug)]
+pub enum CredsspRelayReply {
+    /// Send this TSRequest to the client and wait for its next one.
+    Continue(Vec<u8>),
+    /// The client is authenticated: send `reply` to it, if any.
+    ///
+    /// `credentials` names the authenticated client; its password may be empty, the relay keeps
+    /// the delegated credentials.
+    Done {
+        reply: Option<Vec<u8>>,
+        credentials: Credentials,
+    },
+    /// CredSSP failed: send `reply` (a TSRequest carrying an error code) to the client, if any.
+    Failed { reply: Option<Vec<u8>>, reason: String },
+}
+
+/// Runs the server side of CredSSP elsewhere, for instance in another process holding the
+/// secrets: the acceptor only frames the TSRequests ([MS-CSSP] 2.2.1) and hands them over.
+///
+/// The relay is responsible for the whole of CredSSP, including the binding to the TLS public
+/// key of the server.
+///
+/// [MS-CSSP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/
+#[async_trait::async_trait(?Send)]
+pub trait CredsspRelay {
+    /// Processes one TSRequest of the client, as received.
+    async fn relay(&mut self, ts_request: &[u8]) -> ConnectorResult<CredsspRelayReply>;
+}
 
 pub enum BeginResult<S>
 where
@@ -140,6 +171,118 @@ where
         &mut NoopConnectionSetupHandler,
     )
     .await
+}
+
+/// Runs CredSSP through `relay` and invokes `credentials_handler` before HYBRID_EX reports
+/// success, as [`accept_credssp_with`] does.
+pub async fn accept_credssp_relay<S, H>(
+    framed: &mut Framed<S>,
+    acceptor: &mut Acceptor,
+    relay: &mut dyn CredsspRelay,
+    credentials_handler: &mut H,
+) -> ConnectorResult<()>
+where
+    S: FramedRead + FramedWrite,
+    H: ConnectionSetupHandler,
+{
+    if !acceptor.should_perform_credssp() {
+        return Ok(());
+    }
+    let AcceptorState::Credssp { protocol, .. } = acceptor.state else {
+        unreachable!()
+    };
+    let result = relay_loop(framed, acceptor, relay).await;
+    return finish_credssp_step(framed, acceptor, protocol, result, credentials_handler).await;
+
+    async fn relay_loop<S>(
+        framed: &mut Framed<S>,
+        acceptor: &mut Acceptor,
+        relay: &mut dyn CredsspRelay,
+    ) -> ConnectorResult<()>
+    where
+        S: FramedRead + FramedWrite,
+    {
+        loop {
+            let pdu = framed
+                .read_by_hint(&credssp::CREDSSP_TS_REQUEST_HINT)
+                .await
+                .map_err(|e| custom_err!("read frame by hint", e))?;
+            trace!(length = pdu.len(), "TSRequest received");
+            let (reply, outcome) = match relay.relay(&pdu).await? {
+                CredsspRelayReply::Continue(reply) => (Some(reply), None),
+                CredsspRelayReply::Done { reply, credentials } => (reply, Some(Ok(credentials))),
+                CredsspRelayReply::Failed { reply, reason } => (reply, Some(Err(reason))),
+            };
+            if let Some(reply) = reply {
+                trace!(length = reply.len(), "Send TSRequest");
+                framed
+                    .write_all(&reply)
+                    .await
+                    .map_err(|e| custom_err!("write all", e))?;
+            }
+            match outcome {
+                None => {}
+                Some(Ok(credentials)) => {
+                    acceptor.set_received_relayed_credentials(credentials);
+                    return Ok(());
+                }
+                Some(Err(reason)) => return Err(ironrdp_connector::reason_err!("CredSSP relay", "{reason}")),
+            }
+        }
+    }
+}
+
+/// Ends the CredSSP step: the credentials handler for HYBRID_EX, and its Early User Authorization
+/// Result.
+async fn finish_credssp_step<S, H>(
+    framed: &mut Framed<S>,
+    acceptor: &mut Acceptor,
+    protocol: nego::SecurityProtocol,
+    result: ConnectorResult<()>,
+    credentials_handler: &mut H,
+) -> ConnectorResult<()>
+where
+    S: FramedRead + FramedWrite,
+    H: ConnectionSetupHandler,
+{
+    let mut buf = WriteBuf::new();
+    let result = match result {
+        Ok(()) if protocol.intersects(nego::SecurityProtocol::HYBRID_EX) => match credentials_handler
+            .handle_credentials(acceptor.received_credentials().cloned())
+            .await
+        {
+            Ok(()) => {
+                acceptor.mark_credentials_handled();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
+        result => result,
+    };
+
+    if protocol.intersects(nego::SecurityProtocol::HYBRID_EX) {
+        trace!(?result, "HYBRID_EX");
+
+        let result = if result.is_ok() {
+            EarlyUserAuthResult::Success
+        } else {
+            EarlyUserAuthResult::AccessDenied
+        };
+
+        result
+            .to_buffer(&mut buf)
+            .map_err(|e| ironrdp_connector::custom_err!("to_buffer", e))?;
+        let response = &buf[..result.buffer_len()];
+        framed
+            .write_all(response)
+            .await
+            .map_err(|e| ironrdp_connector::custom_err!("write all", e))?;
+    }
+
+    result?;
+
+    acceptor.mark_credssp_as_done();
+    Ok(())
 }
 
 /// Runs CredSSP and invokes `credentials_handler` before HYBRID_EX reports success.
@@ -420,45 +563,7 @@ where
     )
     .await;
 
-    let result = match result {
-        Ok(()) if protocol.intersects(nego::SecurityProtocol::HYBRID_EX) => match credentials_handler
-            .handle_credentials(acceptor.received_credentials().cloned())
-            .await
-        {
-            Ok(()) => {
-                acceptor.mark_credentials_handled();
-                Ok(())
-            }
-            Err(error) => Err(error),
-        },
-        result => result,
-    };
-
-    if protocol.intersects(nego::SecurityProtocol::HYBRID_EX) {
-        trace!(?result, "HYBRID_EX");
-
-        let result = if result.is_ok() {
-            EarlyUserAuthResult::Success
-        } else {
-            EarlyUserAuthResult::AccessDenied
-        };
-
-        buf.clear();
-        result
-            .to_buffer(&mut buf)
-            .map_err(|e| ironrdp_connector::custom_err!("to_buffer", e))?;
-        let response = &buf[..result.buffer_len()];
-        framed
-            .write_all(response)
-            .await
-            .map_err(|e| ironrdp_connector::custom_err!("write all", e))?;
-    }
-
-    result?;
-
-    acceptor.mark_credssp_as_done();
-
-    return Ok(());
+    return finish_credssp_step(framed, acceptor, protocol, result, credentials_handler).await;
 
     async fn credssp_loop<S, N>(
         framed: &mut Framed<S>,

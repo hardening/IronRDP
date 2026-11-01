@@ -67,6 +67,8 @@ pub struct BuilderDone {
     remotefx_entropy_coder: Option<EntropyBits>,
     udp_bind_addr: Option<SocketAddr>,
     udp_flow_source: Option<Arc<dyn UdpFlowSource>>,
+    credssp_relay: Option<Arc<dyn crate::CredsspRelayFactory>>,
+    tls_besides_hybrid: bool,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -183,6 +185,8 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
                 udp_flow_source: None,
+                credssp_relay: None,
+                tls_besides_hybrid: false,
             },
         }
     }
@@ -220,6 +224,8 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
                 udp_flow_source: None,
+                credssp_relay: None,
+                tls_besides_hybrid: false,
             },
         }
     }
@@ -485,6 +491,21 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Run the server side of CredSSP through relays from `factory` (under
+    /// [`RdpServerSecurity::Hybrid`](crate::RdpServerSecurity::Hybrid)), instead of in the acceptor
+    /// against the server credentials.
+    pub fn with_credssp_relay(mut self, factory: Arc<dyn crate::CredsspRelayFactory>) -> Self {
+        self.state.credssp_relay = Some(factory);
+        self
+    }
+
+    /// Under [`RdpServerSecurity::Hybrid`](crate::RdpServerSecurity::Hybrid), also accept clients
+    /// asking for TLS only. Clients offering NLA still get it.
+    pub fn with_tls_besides_hybrid(mut self) -> Self {
+        self.state.tls_besides_hybrid = true;
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         let mut server = RdpServer::new(
             RdpServerOptions {
@@ -498,6 +519,8 @@ impl RdpServerBuilder<BuilderDone> {
                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
                 udp_bind_addr: self.state.udp_bind_addr,
                 udp_flow_source: self.state.udp_flow_source,
+                credssp_relay: self.state.credssp_relay,
+                tls_besides_hybrid: self.state.tls_besides_hybrid,
             },
             self.state.handler,
             self.state.display,

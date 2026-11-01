@@ -957,6 +957,16 @@ impl Acceptor {
         self.credentials_handled = false;
     }
 
+    /// Stores the identity a [`CredsspRelay`](crate::CredsspRelay) authenticated, for the same
+    /// validation and binding path as the other credentials.
+    pub(crate) fn set_received_relayed_credentials(&mut self, credentials: Credentials) {
+        self.received_credentials = Some(ReceivedCredentials {
+            credentials,
+            origin: CredentialOrigin::CredSspDelegated,
+        });
+        self.credentials_handled = false;
+    }
+
     /// # Panics
     ///
     /// Panics if state is not [AcceptorState::Credssp].

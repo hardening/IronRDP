@@ -34,9 +34,9 @@ pub(crate) enum CredsspState {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CredsspTsRequestHint;
+pub(crate) struct CredsspTsRequestHint;
 
-const CREDSSP_TS_REQUEST_HINT: CredsspTsRequestHint = CredsspTsRequestHint;
+pub(crate) const CREDSSP_TS_REQUEST_HINT: CredsspTsRequestHint = CredsspTsRequestHint;
 
 impl PduHint for CredsspTsRequestHint {
     fn find_size(&self, bytes: &[u8]) -> ironrdp_core::DecodeResult<Option<(bool, usize)>> {
