@@ -1881,6 +1881,7 @@ impl rpce::HeaderlessDecode for TransmitCall {
         let send_buffer = src.read_slice(send_length_usize).to_vec();
 
         let recv_pci = if recv_pci_ptr != 0 {
+            ndr::skip_pad(src)?;
             let mut recv_pci = SCardIORequest::decode_ptr(src, &mut index)?;
             recv_pci.decode_value(src, None)?;
             Some(recv_pci)
@@ -1929,9 +1930,21 @@ impl ndr::Decode for SCardIORequest {
 
     fn decode_value(&mut self, src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<()> {
         expect_no_charset(charset)?;
-        ensure_size!(in: src, size: self.extra_bytes_length);
-        self.extra_bytes = src.read_slice(self.extra_bytes_length).to_vec();
-        Ok(())
+        if self.extra_bytes_length == 0 {
+            return Ok(());
+        }
+        // pbExtraBytes is a conformant array: its count, the bytes, then NDR padding.
+        ensure_size!(in: src, size: size_of::<u32>());
+        let count: usize = cast_length!("SCardIORequest", "extra_bytes count", src.read_u32(), in: src)?;
+        if count != self.extra_bytes_length {
+            return Err(invalid_field_err!(
+                "decode_value",
+                "mismatched SCardIO_Request extra bytes length in NDR pointer and value"
+            ));
+        }
+        ensure_size!(in: src, size: count);
+        self.extra_bytes = src.read_slice(count).to_vec();
+        ndr::skip_pad(src)
     }
 }
 
@@ -1943,12 +1956,24 @@ impl ndr::Encode for SCardIORequest {
             cast_length!("SCardIORequest", "extra_bytes_length", self.extra_bytes_length, in: dst)?;
 
         dst.write_u32(self.protocol.bits());
+        if self.extra_bytes.is_empty() {
+            // cbExtraBytes = 0 and a NULL pbExtraBytes pointer.
+            dst.write_u32(0);
+            dst.write_u32(0);
+            return Ok(());
+        }
         ndr::encode_ptr(Some(extra_bytes_length), index, dst)
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_value());
+        if self.extra_bytes.is_empty() {
+            return Ok(());
+        }
+        dst.write_u32(cast_length!("SCardIORequest", "extra_bytes", self.extra_bytes.len(), in: dst)?);
         dst.write_slice(&self.extra_bytes);
+        let padding = ndr_padding(self.extra_bytes.len());
+        dst.write_slice(&[0; 3][..padding]);
         Ok(())
     }
 
@@ -1957,7 +1982,11 @@ impl ndr::Encode for SCardIORequest {
     }
 
     fn size_value(&self) -> usize {
-        self.extra_bytes_length
+        if self.extra_bytes.is_empty() {
+            0
+        } else {
+            4 /* count */ + self.extra_bytes.len() + ndr_padding(self.extra_bytes.len())
+        }
     }
 }
 
@@ -3309,6 +3338,11 @@ impl rpce::HeaderlessEncode for GetTransmitCountReturn {
     }
 }
 
+/// Padding after an NDR array of `len` bytes, so that the next field is 4-byte aligned.
+fn ndr_padding(len: usize) -> usize {
+    (4 - len % 4) % 4
+}
+
 fn expect_charset(charset: Option<CharacterSet>) -> DecodeResult<CharacterSet> {
     charset.ok_or_else(|| other_err!("internal error: missing character set"))
 }
@@ -3565,6 +3599,86 @@ mod tests {
         assert_eq!(u32_at(16), CardProtocol::SCARD_PROTOCOL_T1.bits()); // pioRecvPci->dwProtocol
         assert_eq!(u32_at(20), 0); // pioRecvPci->cbExtraBytes
         assert_eq!(encoded[encoded.len() - 6..], [2, 0, 0, 0, 0x90, 0x00]); // pbRecvBuffer referent
+    }
+
+    /// pbExtraBytes is a conformant array behind a unique pointer, NULL when empty.
+    #[test]
+    fn scard_io_request_extra_bytes_are_a_conformant_array() {
+        fn encode(pci: &SCardIORequest) -> Vec<u8> {
+            let mut buf = vec![0u8; pci.size()];
+            let mut dst = WriteCursor::new(&mut buf);
+            let mut index = 0;
+            pci.encode_ptr(&mut index, &mut dst).unwrap();
+            pci.encode_value(&mut dst).unwrap();
+            buf
+        }
+
+        let empty = SCardIORequest {
+            protocol: CardProtocol::SCARD_PROTOCOL_T1,
+            extra_bytes_length: 0,
+            extra_bytes: Vec::new(),
+        };
+        assert_eq!(encode(&empty), [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let pci = SCardIORequest {
+            protocol: CardProtocol::SCARD_PROTOCOL_T1,
+            extra_bytes_length: 3,
+            extra_bytes: vec![7, 8, 9],
+        };
+        let encoded = encode(&pci);
+        assert_eq!(
+            encoded,
+            [2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 2, 0, 3, 0, 0, 0, 7, 8, 9, 0] // count, bytes, padding
+        );
+        let mut src = ReadCursor::new(&encoded);
+        let mut index = 0;
+        let mut decoded = SCardIORequest::decode_ptr(&mut src, &mut index).unwrap();
+        decoded.decode_value(&mut src, None).unwrap();
+        assert_eq!(decoded, pci);
+        assert!(src.is_empty());
+    }
+
+    /// The send buffer is padded when the receive SCardIO_Request follows it ([MS-RDPESC] 2.2.2.19).
+    #[test]
+    fn transmit_call_skips_the_send_buffer_padding() {
+        let mut body = Vec::new();
+        for value in [
+            4u32,
+            0x0002_0000, // hContext
+            4,
+            0x0002_0004, // hCard
+            2,
+            0,
+            0, // ioSendPci without extra bytes
+            3,
+            0x0002_0008, // cbSendLength, pbSendBuffer
+            0x0002_000C, // pioRecvPci
+            0,
+            258, // fpbRecvBufferIsNULL, cbRecvLength
+            4,
+            0x0102_0304, // hContext referent
+            4,
+            0x0A0B_0C0D, // hCard referent
+            3,           // pbSendBuffer referent
+        ] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&[0x00, 0xA4, 0x04, 0x00]); // the send buffer and its padding
+        for value in [2u32, 1, 0x0002_0010, 1] {
+            body.extend_from_slice(&value.to_le_bytes()); // pioRecvPci: protocol, cbExtraBytes, pointer, count
+        }
+        body.extend_from_slice(&[7, 0, 0, 0]); // the extra byte and its padding
+
+        let mut pdu = vec![0x01, 0x10, 0x08, 0x00, 0xCC, 0xCC, 0xCC, 0xCC];
+        pdu.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        pdu.extend_from_slice(&0u32.to_le_bytes());
+        pdu.extend_from_slice(&body);
+
+        let decoded = TransmitCall::decode(&mut ReadCursor::new(&pdu)).unwrap();
+        assert_eq!(decoded.send_buffer, [0x00, 0xA4, 0x04]);
+        let recv_pci = decoded.recv_pci.expect("receive PCI");
+        assert_eq!(recv_pci.protocol, CardProtocol::SCARD_PROTOCOL_T1);
+        assert_eq!(recv_pci.extra_bytes, [7]);
     }
 
     /// 6-byte Unicode mszCards needs 2-byte NDR pad before reader states.
