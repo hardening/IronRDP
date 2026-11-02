@@ -137,6 +137,13 @@ impl<T: HeaderlessEncode> ironrdp_core::Encode for Pdu<T> {
 
 impl<T: HeaderlessEncode> Encode for Pdu<T> {}
 
+/// Decodes and drops the headers of an [MS-RPCE] message, leaving `src` on its body.
+pub(crate) fn decode_headers(src: &mut ReadCursor<'_>) -> DecodeResult<()> {
+    let _stream_header = StreamHeader::decode(src)?;
+    let _type_header = TypeHeader::decode(src)?;
+    Ok(())
+}
+
 /// Trait for types that can be encoded into an [MS-RPCE] message.
 ///
 /// Implementers should typically avoid implementing this trait directly

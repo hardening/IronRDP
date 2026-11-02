@@ -28,6 +28,7 @@ use ironrdp_rdpdr::server::{NoopRdpdrServerBackend, RdpdrServer, RdpdrServerBack
 use ironrdp_rdpdr::{NoopRdpdrBackend, Rdpdr, RdpdrBackend};
 
 mod printer;
+mod scard_server;
 
 /// Encodes via a plain `Vec<u8>` buffer for the server-side types in this file, which have
 /// their own inherent `encode`/`size` rather than implementing the crate-wide `Encode` trait

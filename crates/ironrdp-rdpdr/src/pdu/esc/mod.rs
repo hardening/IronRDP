@@ -4,6 +4,9 @@
 
 pub mod ndr;
 pub mod rpce;
+mod server;
+
+pub use server::ScardReturn;
 
 use bitflags::bitflags;
 use ironrdp_core::{
@@ -166,6 +169,19 @@ impl ScardCall {
                 Ok(Self::Unsupported)
             }
         }
+    }
+
+    /// Encodes the call as the input buffer of a smart card `DeviceControlRequest` with
+    /// `io_ctl_code`: the server side of [`Self::decode`].
+    ///
+    /// `io_ctl_code` must be one this call is used with (for example
+    /// [`ScardIoCtlCode::ConnectW`] or [`ScardIoCtlCode::ConnectA`] for a
+    /// [`ScardCall::ConnectCall`]); it gives the character set of the strings. The length
+    /// fields that duplicate a buffer (`send_length`, `groups_length`...) are recomputed from
+    /// that buffer. The reader group management, card cache, card location and reader icon
+    /// calls are not encodable.
+    pub fn encode(&self, io_ctl_code: ScardIoCtlCode) -> EncodeResult<Vec<u8>> {
+        server::encode_call(self, io_ctl_code)
     }
 
     /// Builds the completion for this call failing with `return_code`.
@@ -668,7 +684,7 @@ impl ScardAccessStartedEventCall {
 /// [2.2.3.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/e77a1365-2379-4037-99c4-d30d14ba10fc
 #[derive(Debug, PartialEq, Clone)]
 pub struct LongReturn {
-    return_code: ReturnCode,
+    pub return_code: ReturnCode,
 }
 
 impl LongReturn {
@@ -843,6 +859,83 @@ impl ReturnCode {
     }
 }
 
+impl TryFrom<u32> for ReturnCode {
+    type Error = DecodeError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0x0000_0000 => Ok(ReturnCode::Success),
+            0x8010_0001 => Ok(ReturnCode::InternalError),
+            0x8010_0002 => Ok(ReturnCode::Cancelled),
+            0x8010_0003 => Ok(ReturnCode::InvalidHandle),
+            0x8010_0004 => Ok(ReturnCode::InvalidParameter),
+            0x8010_0005 => Ok(ReturnCode::InvalidTarget),
+            0x8010_0006 => Ok(ReturnCode::NoMemory),
+            0x8010_0007 => Ok(ReturnCode::WaitedTooLong),
+            0x8010_0008 => Ok(ReturnCode::InsufficientBuffer),
+            0x8010_0009 => Ok(ReturnCode::UnknownReader),
+            0x8010_000A => Ok(ReturnCode::Timeout),
+            0x8010_000B => Ok(ReturnCode::SharingViolation),
+            0x8010_000C => Ok(ReturnCode::NoSmartcard),
+            0x8010_000D => Ok(ReturnCode::UnknownCard),
+            0x8010_000E => Ok(ReturnCode::CantDispose),
+            0x8010_000F => Ok(ReturnCode::ProtoMismatch),
+            0x8010_0010 => Ok(ReturnCode::NotReady),
+            0x8010_0011 => Ok(ReturnCode::InvalidValue),
+            0x8010_0012 => Ok(ReturnCode::SystemCancelled),
+            0x8010_0013 => Ok(ReturnCode::CommError),
+            0x8010_0014 => Ok(ReturnCode::UnknownError),
+            0x8010_0015 => Ok(ReturnCode::InvalidAtr),
+            0x8010_0016 => Ok(ReturnCode::NotTransacted),
+            0x8010_0017 => Ok(ReturnCode::ReaderUnavailable),
+            0x8010_0018 => Ok(ReturnCode::Shutdown),
+            0x8010_0019 => Ok(ReturnCode::PciTooSmall),
+            0x8010_0020 => Ok(ReturnCode::IccInstallation),
+            0x8010_0021 => Ok(ReturnCode::IccCreateorder),
+            0x8010_0022 => Ok(ReturnCode::UnsupportedFeature),
+            0x8010_0023 => Ok(ReturnCode::DirNotFound),
+            0x8010_0024 => Ok(ReturnCode::FileNotFound),
+            0x8010_0025 => Ok(ReturnCode::NoDir),
+            0x8010_001A => Ok(ReturnCode::ReaderUnsupported),
+            0x8010_001B => Ok(ReturnCode::DuplicateReader),
+            0x8010_001C => Ok(ReturnCode::CardUnsupported),
+            0x8010_001D => Ok(ReturnCode::NoService),
+            0x8010_001E => Ok(ReturnCode::ServiceStopped),
+            0x8010_001F => Ok(ReturnCode::Unexpected),
+            0x8010_0026 => Ok(ReturnCode::NoFile),
+            0x8010_0027 => Ok(ReturnCode::NoAccess),
+            0x8010_0028 => Ok(ReturnCode::WriteTooMany),
+            0x8010_0029 => Ok(ReturnCode::BadSeek),
+            0x8010_002A => Ok(ReturnCode::InvalidChv),
+            0x8010_002B => Ok(ReturnCode::UnknownResMsg),
+            0x8010_002C => Ok(ReturnCode::NoSuchCertificate),
+            0x8010_002D => Ok(ReturnCode::CertificateUnavailable),
+            0x8010_002E => Ok(ReturnCode::NoReadersAvailable),
+            0x8010_002F => Ok(ReturnCode::CommDataLost),
+            0x8010_0030 => Ok(ReturnCode::NoKeyContainer),
+            0x8010_0031 => Ok(ReturnCode::ServerTooBusy),
+            0x8010_0032 => Ok(ReturnCode::PinCacheExpired),
+            0x8010_0033 => Ok(ReturnCode::NoPinCache),
+            0x8010_0034 => Ok(ReturnCode::ReadOnlyCard),
+            0x8010_0065 => Ok(ReturnCode::UnsupportedCard),
+            0x8010_0066 => Ok(ReturnCode::UnresponsiveCard),
+            0x8010_0067 => Ok(ReturnCode::UnpoweredCard),
+            0x8010_0068 => Ok(ReturnCode::ResetCard),
+            0x8010_0069 => Ok(ReturnCode::RemovedCard),
+            0x8010_006A => Ok(ReturnCode::SecurityViolation),
+            0x8010_006B => Ok(ReturnCode::WrongChv),
+            0x8010_006C => Ok(ReturnCode::ChvBlocked),
+            0x8010_006D => Ok(ReturnCode::Eof),
+            0x8010_006E => Ok(ReturnCode::CancelledByUser),
+            0x8010_006F => Ok(ReturnCode::CardNotAuthenticated),
+            0x8010_0070 => Ok(ReturnCode::CacheItemNotFound),
+            0x8010_0071 => Ok(ReturnCode::CacheItemStale),
+            0x8010_0072 => Ok(ReturnCode::CacheItemTooBig),
+            _ => Err(invalid_field_err!("try_from", "ReturnCode", "unsupported value")),
+        }
+    }
+}
+
 impl From<ReturnCode> for u32 {
     #[expect(
         clippy::as_conversions,
@@ -915,8 +1008,8 @@ impl TryFrom<u32> for Scope {
 /// [2.2.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/9135d95f-3740-411b-bdca-34ac7571fddc
 #[derive(Debug, PartialEq, Clone)]
 pub struct EstablishContextReturn {
-    return_code: ReturnCode,
-    context: ScardContext,
+    pub return_code: ReturnCode,
+    pub context: ScardContext,
 }
 
 impl EstablishContextReturn {

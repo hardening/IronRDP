@@ -441,6 +441,11 @@ pub struct RdpdrServer {
     devices: HashMap<u32, DeviceAnnounceHeader>,
     pending_irps: IrpTracker,
     backend: Box<dyn RdpdrServerBackend>,
+    /// Sent in `ServerCoreCapabilityRequest`. Clients only announce the device types the
+    /// server has a capability set for (smart cards, printers, ports...).
+    capabilities: Vec<CapabilityMessage>,
+    /// `CompletionId` of the last request sent, for [`RdpdrServer::request`].
+    last_completion_id: u32,
 }
 
 impl_as_any!(RdpdrServer);
@@ -488,14 +493,114 @@ fn device_io_request_header(
 impl RdpdrServer {
     pub const NAME: ChannelName = ChannelName::from_static(b"rdpdr\0\0\0");
 
+    /// A server offering the general and drive capability sets.
     pub fn new(backend: Box<dyn RdpdrServerBackend>) -> Self {
+        Self::with_capabilities(
+            backend,
+            vec![CapabilityMessage::new_general(0), CapabilityMessage::new_drive()],
+        )
+    }
+
+    /// A server offering `capabilities` in its `ServerCoreCapabilityRequest`.
+    ///
+    /// The list must start with the general capability set ([`CapabilityMessage::new_general`]);
+    /// add [`CapabilityMessage::new_smartcard`], [`CapabilityMessage::new_printer`] or
+    /// [`CapabilityMessage::new_port`] for the clients to announce those devices.
+    pub fn with_capabilities(backend: Box<dyn RdpdrServerBackend>, capabilities: Vec<CapabilityMessage>) -> Self {
         Self {
             state: RdpdrServerState::Initializing,
             client_id: 0,
             devices: HashMap::new(),
             pending_irps: IrpTracker::new(),
             backend,
+            capabilities,
+            last_completion_id: 0,
         }
+    }
+
+    /// Sends the I/O request described by `message` (as the matching `drive_*` method does).
+    ///
+    /// Returns the request's `CompletionId` along with the messages to send: the client echoes
+    /// it in its completion ([`DeviceIoResponse::completion_id`]), so that a backend with several
+    /// requests in flight can tell which one a completion answers.
+    pub fn request(&mut self, message: RdpdrServerMessage) -> PduResult<(u32, Vec<SvcMessage>)> {
+        let messages = match message {
+            RdpdrServerMessage::Create {
+                device_id,
+                path,
+                desired_access,
+                create_disposition,
+                create_options,
+            } => self.drive_create(device_id, path, desired_access, create_disposition, create_options),
+            RdpdrServerMessage::Read {
+                device_id,
+                file_id,
+                length,
+                offset,
+            } => self.drive_read(device_id, file_id, length, offset),
+            RdpdrServerMessage::Write {
+                device_id,
+                file_id,
+                data,
+                offset,
+            } => self.drive_write(device_id, file_id, data, offset),
+            RdpdrServerMessage::Close { device_id, file_id } => self.drive_close(device_id, file_id),
+            RdpdrServerMessage::FlushBuffers { device_id, file_id } => self.drive_flush_buffers(device_id, file_id),
+            RdpdrServerMessage::QueryInformation {
+                device_id,
+                file_id,
+                info_class,
+            } => self.drive_query_information(device_id, file_id, info_class),
+            RdpdrServerMessage::SetInformation {
+                device_id,
+                file_id,
+                set_buffer,
+            } => self.drive_set_information(device_id, file_id, set_buffer),
+            RdpdrServerMessage::QueryDirectory {
+                device_id,
+                file_id,
+                info_class,
+                path,
+                initial_query,
+            } => self.drive_query_directory(device_id, file_id, info_class, path, initial_query),
+            RdpdrServerMessage::NotifyChangeDirectory {
+                device_id,
+                file_id,
+                watch_tree,
+                completion_filter,
+            } => self.drive_notify_change_directory(device_id, file_id, watch_tree, completion_filter),
+            RdpdrServerMessage::QueryVolumeInformation {
+                device_id,
+                file_id,
+                fs_info_class,
+            } => self.drive_query_volume_information(device_id, file_id, fs_info_class),
+            RdpdrServerMessage::LockControl {
+                device_id,
+                file_id,
+                operation,
+                wait,
+                locks,
+            } => self.drive_lock_control(device_id, file_id, operation, wait, locks),
+            RdpdrServerMessage::QuerySecurity {
+                device_id,
+                file_id,
+                security_information,
+            } => self.drive_query_security(device_id, file_id, security_information),
+            RdpdrServerMessage::SetSecurity {
+                device_id,
+                file_id,
+                security_information,
+                security_descriptor,
+            } => self.drive_set_security(device_id, file_id, security_information, security_descriptor),
+            RdpdrServerMessage::DeviceControl {
+                device_id,
+                file_id,
+                io_control_code,
+                input_buffer,
+                output_buffer_length,
+            } => self.drive_device_control(device_id, file_id, io_control_code, input_buffer, output_buffer_length),
+        }?;
+        Ok((self.last_completion_id, messages))
     }
 
     pub fn downcast_backend<T: RdpdrServerBackend>(&self) -> Option<&T> {
@@ -514,7 +619,7 @@ impl RdpdrServer {
         self.backend.on_client_name(&computer_name);
 
         let capability_request = RdpdrPdu::CoreCapability(CoreCapability {
-            capabilities: vec![CapabilityMessage::new_general(0), CapabilityMessage::new_drive()],
+            capabilities: self.capabilities.clone(),
             kind: CoreCapabilityKind::ServerCoreCapabilityRequest,
         });
         let client_id_confirm = RdpdrPdu::VersionAndIdPdu(VersionAndIdPdu {
@@ -664,6 +769,7 @@ impl RdpdrServer {
         }
 
         let completion_id = self.pending_irps.register(pending);
+        self.last_completion_id = completion_id;
         let request = build(completion_id);
 
         let mut bytes = vec![0u8; SHARED_HEADER_SIZE + request.wire_size()];

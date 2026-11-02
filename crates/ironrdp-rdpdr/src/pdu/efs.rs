@@ -2163,6 +2163,17 @@ impl DeviceControlResponse {
         }
     }
 
+    /// The output buffer as bytes, empty when there is none.
+    ///
+    /// On the server side, this is the IOCTL-specific structure sent by the client (for a smart
+    /// card IOCTL, the RPCE-encoded `*_Return` that [`super::esc::ScardReturn::decode`] parses).
+    pub fn output_bytes(&self) -> EncodeResult<Vec<u8>> {
+        match &self.output_buffer {
+            Some(output_buffer) => ironrdp_core::encode_vec(output_buffer.as_ref()),
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         Self::NAME
     }
