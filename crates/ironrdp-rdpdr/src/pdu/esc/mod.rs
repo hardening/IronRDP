@@ -3526,6 +3526,15 @@ mod tests {
         assert_eq!(enc_headerless(&cache_probe).len(), HeaderlessEncode::size(&cache_probe));
     }
 
+    /// ObjectBufferLength counts the body and its padding, not the headers ([MS-RPCE] 2.2.6.2).
+    #[test]
+    fn rpce_object_buffer_length_excludes_the_headers() {
+        let encoded = ironrdp_core::encode_vec(&LongReturn::new(ReturnCode::NoService)).unwrap();
+        assert_eq!(encoded.len(), 16 + 8);
+        assert_eq!(encoded[8..12], 8u32.to_le_bytes()); // 4-byte Long_Return, 4 bytes of padding
+        assert_eq!(encoded[12..16], [0; 4]); // Filler
+    }
+
     /// 6-byte Unicode mszCards needs 2-byte NDR pad before reader states.
     #[test]
     fn locate_cards_w_skips_msz_cards_ndr_pad() {

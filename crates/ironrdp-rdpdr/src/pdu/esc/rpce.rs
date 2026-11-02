@@ -108,7 +108,10 @@ impl<T: HeaderlessEncode> ironrdp_core::Encode for Pdu<T> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(ctx: self.name(), in: dst, size: self.size());
         let stream_header = StreamHeader::default();
-        let type_header = TypeHeader::new(cast_length!("Pdu<T>", "size", self.size(), in: dst)?);
+        // [MS-RPCE] 2.2.6.2: ObjectBufferLength is the length of the serialized type, padding
+        // included, the headers excluded. FreeRDP checks that many bytes follow the headers.
+        let object_buffer_length = HeaderlessEncode::size(&self.0) + padding_size(&self.0);
+        let type_header = TypeHeader::new(cast_length!("Pdu<T>", "size", object_buffer_length, in: dst)?);
 
         stream_header.encode(dst)?;
         type_header.encode(dst)?;
