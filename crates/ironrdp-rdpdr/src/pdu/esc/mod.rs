@@ -2000,24 +2000,33 @@ impl rpce::HeaderlessEncode for TransmitReturn {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
         dst.write_u32(self.return_code.into());
+        // [MS-RDPESC] 2.2.3.11: the pioRecvPci pointer, cbRecvLength and the pbRecvBuffer
+        // pointer, then the deferred SCardIO_Request and the receive buffer.
         let mut index = 0;
-        if let Some(recv_pci) = &self.recv_pci {
-            recv_pci.encode_ptr(&mut index, dst)?;
-            recv_pci.encode_value(dst)?;
+        if self.recv_pci.is_some() {
+            ndr::encode_ptr(None, &mut index, dst)?;
         } else {
             dst.write_u32(0);
         }
-        match &self.recv_buffer {
+        let recv_buffer_len = match &self.recv_buffer {
             Some(buf) => {
                 let n: u32 = cast_length!("TransmitReturn", "recv_buffer_len", buf.len(), in: dst)?;
                 ndr::encode_ptr(Some(n), &mut index, dst)?;
-                dst.write_u32(n);
-                dst.write_slice(buf);
+                Some(n)
             }
             None => {
                 dst.write_u32(self.recv_len);
                 dst.write_u32(0);
+                None
             }
+        };
+        if let Some(recv_pci) = &self.recv_pci {
+            recv_pci.encode_ptr(&mut index, dst)?;
+            recv_pci.encode_value(dst)?;
+        }
+        if let (Some(buf), Some(n)) = (&self.recv_buffer, recv_buffer_len) {
+            dst.write_u32(n);
+            dst.write_slice(buf);
         }
         Ok(())
     }
@@ -2028,7 +2037,8 @@ impl rpce::HeaderlessEncode for TransmitReturn {
 
     fn size(&self) -> usize {
         self.return_code.size()
-            + self.recv_pci.as_ref().map_or(4, SCardIORequest::size)
+            + 4 // pioRecvPci pointer
+            + self.recv_pci.as_ref().map_or(0, SCardIORequest::size)
             + match &self.recv_buffer {
                 Some(buf) => ndr::ptr_size(true) + 4 + buf.len(),
                 None => 8,
@@ -3533,6 +3543,28 @@ mod tests {
         assert_eq!(encoded.len(), 16 + 8);
         assert_eq!(encoded[8..12], 8u32.to_le_bytes()); // 4-byte Long_Return, 4 bytes of padding
         assert_eq!(encoded[12..16], [0; 4]); // Filler
+    }
+
+    /// pioRecvPci is a pointer: its SCardIO_Request comes after cbRecvLength and the pbRecvBuffer
+    /// pointer, and the receive buffer last ([MS-RDPESC] 2.2.3.11).
+    #[test]
+    fn transmit_return_defers_the_receive_pci() {
+        let pci = SCardIORequest {
+            protocol: CardProtocol::SCARD_PROTOCOL_T1,
+            extra_bytes_length: 0,
+            extra_bytes: Vec::new(),
+        };
+        let ret = TransmitReturn::new(ReturnCode::Success, Some(pci), vec![0x90, 0x00]).into_inner();
+        let encoded = enc_headerless(&ret);
+        assert_eq!(encoded.len(), HeaderlessEncode::size(&ret));
+        let u32_at = |offset: usize| u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 0); // ReturnCode
+        assert_eq!(u32_at(4), 0x0002_0000); // pioRecvPci
+        assert_eq!(u32_at(8), 2); // cbRecvLength
+        assert_eq!(u32_at(12), 0x0002_0004); // pbRecvBuffer
+        assert_eq!(u32_at(16), CardProtocol::SCARD_PROTOCOL_T1.bits()); // pioRecvPci->dwProtocol
+        assert_eq!(u32_at(20), 0); // pioRecvPci->cbExtraBytes
+        assert_eq!(encoded[encoded.len() - 6..], [2, 0, 0, 0, 0x90, 0x00]); // pbRecvBuffer referent
     }
 
     /// 6-byte Unicode mszCards needs 2-byte NDR pad before reader states.
