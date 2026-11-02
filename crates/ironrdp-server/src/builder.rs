@@ -2,6 +2,7 @@ use core::net::SocketAddr;
 use std::sync::Arc;
 
 use ironrdp_pdu::codecs::rfx::Quant;
+use ironrdp_pdu::nego;
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, EntropyBits, server_codecs_capabilities};
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use tokio_rustls::TlsAcceptor;
@@ -69,6 +70,7 @@ pub struct BuilderDone {
     udp_flow_source: Option<Arc<dyn UdpFlowSource>>,
     credssp_relay: Option<Arc<dyn crate::CredsspRelayFactory>>,
     tls_besides_hybrid: bool,
+    credssp_response_flags: nego::ResponseFlags,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -187,6 +189,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 udp_flow_source: None,
                 credssp_relay: None,
                 tls_besides_hybrid: false,
+                credssp_response_flags: nego::ResponseFlags::empty(),
             },
         }
     }
@@ -226,6 +229,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 udp_flow_source: None,
                 credssp_relay: None,
                 tls_besides_hybrid: false,
+                credssp_response_flags: nego::ResponseFlags::empty(),
             },
         }
     }
@@ -506,6 +510,15 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Tell the clients getting CredSSP the modes it supports: Restricted Admin
+    /// (`RESTRICTED_ADMIN_MODE_SUPPORTED`), Remote Credential Guard
+    /// (`REDIRECTED_AUTHENTICATION_MODE_SUPPORTED`). The CredSSP server (a relay, for instance)
+    /// must accept their credentials.
+    pub fn with_credssp_response_flags(mut self, flags: nego::ResponseFlags) -> Self {
+        self.state.credssp_response_flags = flags;
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         let mut server = RdpServer::new(
             RdpServerOptions {
@@ -521,6 +534,7 @@ impl RdpServerBuilder<BuilderDone> {
                 udp_flow_source: self.state.udp_flow_source,
                 credssp_relay: self.state.credssp_relay,
                 tls_besides_hybrid: self.state.tls_besides_hybrid,
+                credssp_response_flags: self.state.credssp_response_flags,
             },
             self.state.handler,
             self.state.display,

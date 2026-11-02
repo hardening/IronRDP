@@ -151,6 +151,8 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     pub(crate) credssp_backend: crate::CredsspBackend,
+    /// flags of RDP_NEG_RSP told when the client gets CredSSP
+    credssp_response_flags: nego::ResponseFlags,
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
@@ -496,6 +498,7 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             credssp_backend: crate::CredsspBackend::default(),
+            credssp_response_flags: nego::ResponseFlags::empty(),
             received_credentials: None,
             credentials_handled: false,
             received_auto_reconnect: None,
@@ -562,6 +565,17 @@ impl Acceptor {
     }
 
     /// Selects the CredSSP authentication provider before negotiation begins.
+    /// Tells the client, when it gets CredSSP (HYBRID, HYBRID_EX), the modes the server supports:
+    /// [`nego::ResponseFlags::RESTRICTED_ADMIN_MODE_SUPPORTED`],
+    /// [`nego::ResponseFlags::REDIRECTED_AUTHENTICATION_MODE_SUPPORTED`] (Remote Credential Guard)
+    /// ([MS-RDPBCGR] 2.2.1.2.1). The CredSSP server must then accept the credentials of these
+    /// modes.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub fn set_credssp_response_flags(&mut self, flags: nego::ResponseFlags) {
+        self.credssp_response_flags = flags;
+    }
+
     pub fn set_credssp_backend(&mut self, backend: crate::CredsspBackend) {
         self.credssp_backend = backend;
     }
@@ -756,6 +770,7 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             credssp_backend: consumed.credssp_backend,
+            credssp_response_flags: consumed.credssp_response_flags,
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,
@@ -1253,8 +1268,15 @@ impl Sequence for Acceptor {
                         requested_protocol,
                     ));
                 };
+                // the modes of CredSSP the server supports (Restricted Admin, Remote Credential
+                // Guard) are told only when CredSSP runs
+                let credssp_flags = if protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+                    self.credssp_response_flags
+                } else {
+                    nego::ResponseFlags::empty()
+                };
                 let connection_confirm = nego::ConnectionConfirm::Response {
-                    flags: nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED,
+                    flags: nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED | credssp_flags,
                     protocol,
                 };
 

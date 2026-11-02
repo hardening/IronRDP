@@ -802,6 +802,9 @@ pub struct RdpServerOptions {
     /// credentials then come in ClientInfo). Set via
     /// [`RdpServerBuilder::with_tls_besides_hybrid`](crate::RdpServerBuilder::with_tls_besides_hybrid).
     pub tls_besides_hybrid: bool,
+    /// The modes of CredSSP told to the client (Restricted Admin, Remote Credential Guard). Set
+    /// via [`RdpServerBuilder::with_credssp_response_flags`](crate::RdpServerBuilder::with_credssp_response_flags).
+    pub credssp_response_flags: nego::ResponseFlags,
 }
 
 /// Gives each connection the [`CredsspRelay`](ironrdp_acceptor::CredsspRelay) running its CredSSP
@@ -2325,6 +2328,9 @@ where
         },
     );
     pending.credssp_relay = ctx.opts.credssp_relay.clone();
+    pending
+        .acceptor
+        .set_credssp_response_flags(ctx.opts.credssp_response_flags);
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
     // sound / gfx backends means running user-supplied factories for a peer
@@ -3294,6 +3300,9 @@ impl RdpServer {
             },
         );
         pending.credssp_relay = self.opts.credssp_relay.clone();
+        pending
+            .acceptor
+            .set_credssp_response_flags(self.opts.credssp_response_flags);
 
         let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
             return Ok(());
@@ -6793,6 +6802,7 @@ mod preempt_tests {
                 udp_flow_source: None,
                 credssp_relay: None,
                 tls_besides_hybrid: false,
+                credssp_response_flags: nego::ResponseFlags::empty(),
             },
             creds: None,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
