@@ -671,6 +671,17 @@ fn rdpdr_server_sends_the_configured_capabilities() {
 }
 
 #[test]
+fn device_announce_header_exposes_the_device_type() {
+    use ironrdp_rdpdr::pdu::efs::{DeviceAnnounceHeader, DeviceType};
+
+    assert_eq!(DeviceAnnounceHeader::new_smartcard(1).device_type(), DeviceType::Smartcard);
+    assert_eq!(
+        DeviceAnnounceHeader::new_printer(2, "Lobby".to_owned()).device_type(),
+        DeviceType::Print
+    );
+}
+
+#[test]
 fn rdpdr_server_request_returns_the_completion_id_it_sends() {
     let mut server = RdpdrServer::new(Box::new(NoopRdpdrServerBackend));
     handshake_to_active(&mut server);
