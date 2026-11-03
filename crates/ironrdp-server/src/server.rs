@@ -469,6 +469,35 @@ pub trait ConnectionBinder: Send + Sync {
         credentials: &Credentials,
         desktop_size: DesktopSize,
     ) -> ServerResult<BoundConnection>;
+
+    /// [`Self::bind_connection`] with what the client said of itself before the binding (its
+    /// Client Info flags: `INFO_RAIL` for remote applications...). The server calls this one;
+    /// by default it is [`Self::bind_connection`].
+    async fn bind_connection_with_info(
+        &self,
+        credentials: &Credentials,
+        desktop_size: DesktopSize,
+        info: &ConnectionBindInfo,
+    ) -> ServerResult<BoundConnection> {
+        let _ = info;
+        self.bind_connection(credentials, desktop_size).await
+    }
+}
+
+/// What a [`ConnectionBinder`] knows of the client besides its credentials.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectionBindInfo {
+    /// The flags of the client's Info PDU (MS-RDPBCGR 2.2.1.11.1.1): `INFO_RAIL` when it asks
+    /// for remote applications.
+    pub client_info_flags: rdp::client_info::ClientInfoFlags,
+}
+
+impl ConnectionBindInfo {
+    /// For binders' tests: the struct is `#[non_exhaustive]`.
+    pub fn new(client_info_flags: rdp::client_info::ClientInfoFlags) -> Self {
+        Self { client_info_flags }
+    }
 }
 
 struct BoundDisplaySlot {
@@ -1370,6 +1399,8 @@ pub struct RdpServer {
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     connection_binder: Option<Arc<dyn ConnectionBinder>>,
     pending_authenticated_credentials: Arc<StdMutex<Option<Credentials>>>,
+    /// the Client Info flags of the connection being accepted, for the binder
+    pending_client_info_flags: rdp::client_info::ClientInfoFlags,
     local_addr: Option<SocketAddr>,
     /// The local address the current client reached. See
     /// [`Self::set_connection_local_addr`].
@@ -2492,6 +2523,7 @@ impl RdpServer {
             credential_validator: None,
             connection_binder: None,
             pending_authenticated_credentials: Arc::new(StdMutex::new(None)),
+            pending_client_info_flags: rdp::client_info::ClientInfoFlags::empty(),
             local_addr: None,
             connection_local_addr: None,
             autodetect_enabled: false,
@@ -6761,6 +6793,11 @@ pub async fn dispatch_static_channel_events(
 
 #[async_trait::async_trait(?Send)]
 impl ConnectionSetupHandler for RdpServer {
+    async fn handle_client_info(&mut self, flags: rdp::client_info::ClientInfoFlags) -> Result<(), ConnectorError> {
+        self.pending_client_info_flags = flags;
+        Ok(())
+    }
+
     async fn handle_credentials(&mut self, credentials: Option<ReceivedCredentials>) -> Result<(), ConnectorError> {
         self.prepare_authenticated_connection(credentials).await
     }
@@ -6787,8 +6824,11 @@ impl ConnectionSetupHandler for RdpServer {
             .expect("authenticated credentials lock poisoned")
             .clone()
             .ok_or_else(|| ConnectorError::general("no authenticated credentials for connection binding"))?;
+        let info = ConnectionBindInfo {
+            client_info_flags: self.pending_client_info_flags,
+        };
         let bound = binder
-            .bind_connection(&credentials, desktop_size)
+            .bind_connection_with_info(&credentials, desktop_size, &info)
             .await
             .map_err(|error| ConnectorError::custom("connection binder failed", error))?;
 

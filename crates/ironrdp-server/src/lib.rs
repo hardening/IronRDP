@@ -70,12 +70,12 @@ pub use server::autodetect_response_from_sub_header;
 #[cfg(all(feature = "__test", feature = "egfx"))]
 pub use server::autodetect_sub_header;
 pub use server::{
-    AuthenticatedConnection, AutoReconnectCookieHandle, BoundConnection, ConnectionBinder, ConnectionHandler,
-    ConnectionInfo, ConnectionPolicy, ConnectionSource, CredentialDecision, CredentialValidationError,
-    CredentialValidator, Credentials, ErrorInfoDisconnectHandle, ExactMatchCredentialValidator, IncomingConnection,
-    NextConnection, PostConnectionAction, RdpServer, RdpServerHandle, RdpServerOptions, RdpServerSecurity, ServerEvent,
-    ServerEventSender, ServerRedirectionHandle, SessionOutcome, StaticChannelFactory, TransportTls,
-    pick_remotefx_entropy_coder,
+    AuthenticatedConnection, AutoReconnectCookieHandle, BoundConnection, ConnectionBindInfo, ConnectionBinder,
+    ConnectionHandler, ConnectionInfo, ConnectionPolicy, ConnectionSource, CredentialDecision,
+    CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
+    ExactMatchCredentialValidator, IncomingConnection, NextConnection, PostConnectionAction, RdpServer,
+    RdpServerHandle, RdpServerOptions, RdpServerSecurity, ServerEvent, ServerEventSender, ServerRedirectionHandle,
+    SessionOutcome, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
 };
 #[cfg(feature = "__test")]
 pub use server::{SharedWriter, client_max_request_size, dispatch_static_channel_events, pick_remotefx_codec};
