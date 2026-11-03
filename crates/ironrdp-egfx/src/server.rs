@@ -1453,6 +1453,35 @@ impl GraphicsPipelineServer {
         true
     }
 
+    /// Map a surface to a RemoteApp window (MS-RDPEGFX 2.2.2.20): the client shows the surface
+    /// as the window's content, `mapped_width` × `mapped_height` of it.
+    pub fn map_surface_to_window(
+        &mut self,
+        surface_id: u16,
+        window_id: u64,
+        mapped_width: u32,
+        mapped_height: u32,
+    ) -> bool {
+        let Some(surface) = self.surfaces.get_mut(surface_id) else {
+            return false;
+        };
+
+        surface.is_mapped = true;
+        self.output_queue
+            .push_back(GfxPdu::MapSurfaceToWindow(crate::pdu::MapSurfaceToWindowPdu {
+                surface_id,
+                window_id,
+                mapped_width,
+                mapped_height,
+            }));
+
+        debug!(
+            surface_id,
+            window_id, mapped_width, mapped_height, "Mapped surface to window"
+        );
+        true
+    }
+
     /// Get a surface by ID
     #[must_use]
     pub fn get_surface(&self, surface_id: u16) -> Option<&Surface> {

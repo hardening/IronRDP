@@ -238,6 +238,10 @@ pub struct ConnectionInfo {
     /// The server itself doesn't start the rdpsnd channel when they ask for no audio redirection; the rest, such as
     /// whether to offer a microphone, is the embedder's to act on.
     pub client_info_flags: rdp::client_info::ClientInfoFlags,
+    /// RemoteApp (MS-RDPERP) was negotiated: the client asked for it (`INFO_RAIL`) and confirmed
+    /// the Remote Programs and Window List capabilities. The embedder speaks the `rail` channel
+    /// and sends window orders ([`ServerEvent::WindowingOrders`]).
+    pub remote_app: bool,
 }
 
 impl ConnectionInfo {
@@ -261,6 +265,7 @@ impl ConnectionInfo {
             redirected_session_id: None,
             password_cookie: None,
             client_info_flags: rdp::client_info::ClientInfoFlags::empty(),
+            remote_app: false,
         }
     }
 }
@@ -794,6 +799,10 @@ pub struct RdpServerOptions {
     /// socket bound to `udp_bind_addr`, which it takes precedence over. Set via
     /// [`RdpServerBuilder::with_udp_flow_source`](crate::RdpServerBuilder::with_udp_flow_source).
     pub udp_flow_source: Option<Arc<dyn multitransport::UdpFlowSource>>,
+    /// Advertise the Remote Programs and Window List capability sets (RemoteApp, MS-RDPERP):
+    /// clients asking for remote applications (`INFO_RAIL`) get them, and
+    /// [`ConnectionInfo::remote_app`] says when they were negotiated.
+    pub remote_app: bool,
     /// Where the server side of CredSSP runs, under [`RdpServerSecurity::Hybrid`], instead of in
     /// the acceptor against the server credentials. Set via
     /// [`RdpServerBuilder::with_credssp_relay`](crate::RdpServerBuilder::with_credssp_relay).
@@ -1530,6 +1539,9 @@ pub enum ServerEvent {
     /// See [`ServerRedirectionHandle::redirect`].
     Redirect(Box<ServerRedirectionPdu>),
     Clipboard(ClipboardMessage),
+    /// Windowing orders (RemoteApp, MS-RDPERP 2.2.1.3), sent as one Fast-Path Orders update.
+    /// Only meaningful when [`ConnectionInfo::remote_app`] was negotiated; dropped otherwise.
+    WindowingOrders(Vec<ironrdp_pdu::window::WindowingOrder>),
     /// Writes one PDU to a joined static channel, splitting it into chunks as needed.
     ///
     /// Fragmented PDUs set `SHOW_PROTOCOL` on every chunk per [MS-RDPBCGR] section 3.1.5.2.1,
@@ -1608,6 +1620,7 @@ impl fmt::Debug for ServerEvent {
             Self::Disconnect(error) => f.debug_tuple("Disconnect").field(error).finish(),
             Self::Redirect(redirection) => f.debug_tuple("Redirect").field(redirection).finish(),
             Self::Clipboard(..) => f.write_str("Clipboard(..)"),
+            Self::WindowingOrders(orders) => f.debug_tuple("WindowingOrders").field(&orders.len()).finish(),
             Self::StaticChannelWithCompletion { name, payload, .. } => f
                 .debug_tuple("StaticChannelWithCompletion")
                 .field(&name.as_str())
@@ -4043,6 +4056,33 @@ impl RdpServer {
                         trace!(channel_id, "Static channel producer stopped waiting for dispatch");
                     }
                 }
+                ServerEvent::WindowingOrders(orders) => {
+                    if orders.is_empty() {
+                        continue;
+                    }
+                    let Ok(count) = u16::try_from(orders.len()) else {
+                        warn!(count = orders.len(), "Too many windowing orders in one update, dropped");
+                        continue;
+                    };
+                    let size = 2 + orders.iter().map(ironrdp_core::Encode::size).sum::<usize>();
+                    let mut data = vec![0u8; size];
+                    {
+                        let mut cursor = ironrdp_core::WriteCursor::new(&mut data);
+                        cursor.write_u16(count);
+                        for order in &orders {
+                            ironrdp_core::Encode::encode(order, &mut cursor).map_err(ServerError::encode)?;
+                        }
+                    }
+                    let mut fragmenter =
+                        crate::encoder::UpdateFragmenter::new(ironrdp_pdu::fast_path::UpdateCode::Orders, data);
+                    let mut buffer = vec![0u8; fragmenter.size_hint()];
+                    while let Some(len) = fragmenter.next(&mut buffer) {
+                        writer
+                            .write_all(&buffer[..len])
+                            .await
+                            .map_err(|e| ServerError::io("failed to write windowing orders", e))?;
+                    }
+                }
                 ServerEvent::StaticChannelJoined(name, reply) => {
                     let joined = conn.static_channels.get_channel_id_by_channel_name(&name).is_some();
                     if reply.send(joined).is_err() {
@@ -5568,6 +5608,7 @@ impl RdpServer {
                         .map(|cluster| cluster.redirected_session_id),
                     password_cookie: result.password_cookie.clone(),
                     client_info_flags: result.client_info_flags,
+                    remote_app: acceptor.remote_app_capabilities().is_some(),
                 });
             });
         }
@@ -6800,6 +6841,7 @@ mod preempt_tests {
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
                 udp_flow_source: None,
+                remote_app: false,
                 credssp_relay: None,
                 tls_besides_hybrid: false,
                 credssp_response_flags: nego::ResponseFlags::empty(),

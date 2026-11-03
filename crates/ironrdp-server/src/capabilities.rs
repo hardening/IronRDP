@@ -19,6 +19,21 @@ pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<ca
         caps.push(capability_sets::CapabilitySet::LargePointer(large_pointer));
     }
 
+    // the acceptor offers them only to clients asking for remote applications (INFO_RAIL)
+    if opts.remote_app {
+        caps.push(capability_sets::CapabilitySet::Rail(capability_sets::Rail {
+            support_level: capability_sets::RailSupportLevel::SUPPORTED,
+        }));
+        caps.push(capability_sets::CapabilitySet::WindowList(
+            capability_sets::WindowList {
+                // FreeRDP refuses window orders with a client area size below SupportedEx
+                support_level: capability_sets::WindowSupportLevel::SupportedEx,
+                num_icon_caches: 3,
+                num_icon_cache_entries: 12,
+            },
+        ));
+    }
+
     caps
 }
 

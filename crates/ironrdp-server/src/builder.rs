@@ -68,6 +68,7 @@ pub struct BuilderDone {
     remotefx_entropy_coder: Option<EntropyBits>,
     udp_bind_addr: Option<SocketAddr>,
     udp_flow_source: Option<Arc<dyn UdpFlowSource>>,
+    remote_app: bool,
     credssp_relay: Option<Arc<dyn crate::CredsspRelayFactory>>,
     tls_besides_hybrid: bool,
     credssp_response_flags: nego::ResponseFlags,
@@ -187,6 +188,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
                 udp_flow_source: None,
+                remote_app: false,
                 credssp_relay: None,
                 tls_besides_hybrid: false,
                 credssp_response_flags: nego::ResponseFlags::empty(),
@@ -227,6 +229,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
                 udp_flow_source: None,
+                remote_app: false,
                 credssp_relay: None,
                 tls_besides_hybrid: false,
                 credssp_response_flags: nego::ResponseFlags::empty(),
@@ -495,6 +498,12 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Offer RemoteApp (MS-RDPERP): see [`RdpServerOptions::remote_app`].
+    pub fn with_remote_app(mut self, enabled: bool) -> Self {
+        self.state.remote_app = enabled;
+        self
+    }
+
     /// Run the server side of CredSSP through relays from `factory` (under
     /// [`RdpServerSecurity::Hybrid`](crate::RdpServerSecurity::Hybrid)), instead of in the acceptor
     /// against the server credentials.
@@ -532,6 +541,7 @@ impl RdpServerBuilder<BuilderDone> {
                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
                 udp_bind_addr: self.state.udp_bind_addr,
                 udp_flow_source: self.state.udp_flow_source,
+                remote_app: self.state.remote_app,
                 credssp_relay: self.state.credssp_relay,
                 tls_besides_hybrid: self.state.tls_besides_hybrid,
                 credssp_response_flags: self.state.credssp_response_flags,
