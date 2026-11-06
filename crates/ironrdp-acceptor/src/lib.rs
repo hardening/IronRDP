@@ -84,6 +84,16 @@ pub trait ConnectionSetupHandler {
         Ok(())
     }
 
+    /// Observes the Client Auto-Reconnect Packet of Client Info (`None` without one), not
+    /// verified, before capability setup.
+    async fn handle_client_auto_reconnect(
+        &mut self,
+        auto_reconnect: Option<ironrdp_pdu::rdp::client_info::ClientAutoReconnect>,
+    ) -> ConnectorResult<()> {
+        let _ = auto_reconnect;
+        Ok(())
+    }
+
     /// Observes Client Info and Client Core Data session settings before capability setup.
     #[expect(
         clippy::too_many_arguments,
@@ -423,6 +433,9 @@ where
         if !client_info_notified && let Some(flags) = acceptor.client_info_flags() {
             credentials_handler.handle_client_info(flags).await?;
             credentials_handler
+                .handle_client_auto_reconnect(acceptor.received_auto_reconnect().cloned())
+                .await?;
+            credentials_handler
                 .handle_client_session_config(
                     flags,
                     acceptor.performance_flags(),
@@ -451,7 +464,7 @@ where
             acceptor.mark_credentials_handled();
         }
         if !acceptor.is_reactivation()
-            && !acceptor.is_auto_reconnect_attempt()
+            && !acceptor.auto_reconnect_skips_setup()
             && acceptor.is_ready_for_capability_exchange()
             && let Err(error) = credentials_handler
                 .prepare_capability_exchange(acceptor.desktop_size())

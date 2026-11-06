@@ -491,12 +491,25 @@ pub struct ConnectionBindInfo {
     /// The flags of the client's Info PDU (MS-RDPBCGR 2.2.1.11.1.1): `INFO_RAIL` when it asks
     /// for remote applications.
     pub client_info_flags: rdp::client_info::ClientInfoFlags,
+    /// The Client Auto-Reconnect Packet of its Info PDU (MS-RDPBCGR 2.2.4.3), not verified:
+    /// with [`RdpServer::set_auto_reconnect_external`], the binder verifies it (and refuses
+    /// the binding when it doesn't hold).
+    pub auto_reconnect: Option<rdp::client_info::ClientAutoReconnect>,
 }
 
 impl ConnectionBindInfo {
     /// For binders' tests: the struct is `#[non_exhaustive]`.
     pub fn new(client_info_flags: rdp::client_info::ClientInfoFlags) -> Self {
-        Self { client_info_flags }
+        Self {
+            client_info_flags,
+            auto_reconnect: None,
+        }
+    }
+
+    /// [`Self::new`] with an auto-reconnect packet.
+    pub fn with_auto_reconnect(mut self, auto_reconnect: Option<rdp::client_info::ClientAutoReconnect>) -> Self {
+        self.auto_reconnect = auto_reconnect;
+        self
     }
 }
 
@@ -1401,6 +1414,8 @@ pub struct RdpServer {
     pending_authenticated_credentials: Arc<StdMutex<Option<Credentials>>>,
     /// the Client Info flags of the connection being accepted, for the binder
     pending_client_info_flags: rdp::client_info::ClientInfoFlags,
+    /// the client's auto-reconnect packet, for the binder
+    pending_client_auto_reconnect: Option<rdp::client_info::ClientAutoReconnect>,
     local_addr: Option<SocketAddr>,
     /// The local address the current client reached. See
     /// [`Self::set_connection_local_addr`].
@@ -1452,6 +1467,9 @@ pub struct RdpServer {
     /// client that came back with a verified one; see
     /// [`Self::set_auto_reconnect_on_request`].
     auto_reconnect_on_request: bool,
+    /// The connection binder verifies the clients' auto-reconnect packets and gives the
+    /// cookies; see [`Self::set_auto_reconnect_external`].
+    auto_reconnect_external: bool,
     /// Whether the client's core Frame Acknowledge capability caps the EGFX
     /// frame window; see [`Self::set_egfx_core_frame_ack_limit`].
     #[cfg(feature = "egfx")]
@@ -2328,6 +2346,7 @@ struct NegotiationContext {
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     requires_authenticated_credentials: bool,
+    auto_reconnect_external: bool,
 }
 
 /// Negotiate and authenticate a candidate connection against a cloned `ctx`,
@@ -2375,6 +2394,7 @@ where
     pending
         .acceptor
         .set_credssp_response_flags(ctx.opts.credssp_response_flags);
+    pending.acceptor.set_auto_reconnect_external(ctx.auto_reconnect_external);
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
     // sound / gfx backends means running user-supplied factories for a peer
@@ -2524,6 +2544,7 @@ impl RdpServer {
             connection_binder: None,
             pending_authenticated_credentials: Arc::new(StdMutex::new(None)),
             pending_client_info_flags: rdp::client_info::ClientInfoFlags::empty(),
+            pending_client_auto_reconnect: None,
             local_addr: None,
             connection_local_addr: None,
             autodetect_enabled: false,
@@ -2534,6 +2555,7 @@ impl RdpServer {
             previous_auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
             auto_reconnect_on_request: false,
+            auto_reconnect_external: false,
             #[cfg(feature = "egfx")]
             egfx_core_frame_ack_limit: false,
         }
@@ -2626,6 +2648,16 @@ impl RdpServer {
     /// effect there.
     pub fn set_auto_reconnect_on_request(&mut self, on_request: bool) {
         self.auto_reconnect_on_request = on_request;
+    }
+
+    /// Auto-reconnect is the embedder's: the connection binder gets the client's packet
+    /// ([`ConnectionBindInfo::auto_reconnect`]) and verifies it, refusing the binding when it
+    /// doesn't hold (the server doesn't verify it, nor refuse it for having a binder); the server
+    /// sends the cookies given through [`AutoReconnectCookieHandle`] only, never one of its own,
+    /// and doesn't rotate them. For a server whose sessions outlive its process (a session
+    /// manager keeping the cookies).
+    pub fn set_auto_reconnect_external(&mut self, external: bool) {
+        self.auto_reconnect_external = external;
     }
 
     /// Choose whether the client's `maxUnacknowledgedFrameCount` caps the EGFX
@@ -3180,6 +3212,7 @@ impl RdpServer {
             display: Arc::clone(&self.display),
             credential_validator: self.credential_validator.clone(),
             requires_authenticated_credentials: self.connection_binder.is_some(),
+            auto_reconnect_external: self.auto_reconnect_external,
         }
     }
 
@@ -3348,6 +3381,7 @@ impl RdpServer {
         pending
             .acceptor
             .set_credssp_response_flags(self.opts.credssp_response_flags);
+        pending.acceptor.set_auto_reconnect_external(self.auto_reconnect_external);
 
         let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
             return Ok(());
@@ -5578,7 +5612,10 @@ impl RdpServer {
     {
         debug!("Client accepted");
 
-        let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
+        let is_auto_reconnect = if self.auto_reconnect_external {
+            // the binder verified it (it refused the binding otherwise)
+            result.auto_reconnect.is_some()
+        } else if let Some(reconnect) = result.auto_reconnect.as_ref() {
             if !self.verify_auto_reconnect_cookie(reconnect) {
                 warn!("Auto-reconnect cookie validation rejected");
                 send_access_denied(acceptor, writer).await?;
@@ -5826,7 +5863,7 @@ impl RdpServer {
 
         // By default every connection gets a cookie at activation. On request, only one that came
         // back with a verified cookie does.
-        if !self.auto_reconnect_on_request || is_auto_reconnect {
+        if !self.auto_reconnect_external && (!self.auto_reconnect_on_request || is_auto_reconnect) {
             self.send_next_auto_reconnect_cookie(conn, writer, result.io_channel_id, result.user_channel_id)
                 .await?;
         }
@@ -6798,6 +6835,14 @@ impl ConnectionSetupHandler for RdpServer {
         Ok(())
     }
 
+    async fn handle_client_auto_reconnect(
+        &mut self,
+        auto_reconnect: Option<rdp::client_info::ClientAutoReconnect>,
+    ) -> Result<(), ConnectorError> {
+        self.pending_client_auto_reconnect = auto_reconnect;
+        Ok(())
+    }
+
     async fn handle_credentials(&mut self, credentials: Option<ReceivedCredentials>) -> Result<(), ConnectorError> {
         self.prepare_authenticated_connection(credentials).await
     }
@@ -6826,6 +6871,7 @@ impl ConnectionSetupHandler for RdpServer {
             .ok_or_else(|| ConnectorError::general("no authenticated credentials for connection binding"))?;
         let info = ConnectionBindInfo {
             client_info_flags: self.pending_client_info_flags,
+            auto_reconnect: self.pending_client_auto_reconnect.clone(),
         };
         let bound = binder
             .bind_connection_with_info(&credentials, desktop_size, &info)
@@ -6890,6 +6936,7 @@ mod preempt_tests {
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
             credential_validator: None,
             requires_authenticated_credentials: false,
+            auto_reconnect_external: false,
         }
     }
 

@@ -156,6 +156,9 @@ pub struct Acceptor {
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    /// an auto-reconnection goes through the credentials and the capability setup as any logon:
+    /// the setup handler verifies the packet (see `set_auto_reconnect_external`)
+    auto_reconnect_external: bool,
     allow_unverified_credentials: bool,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
@@ -502,6 +505,7 @@ impl Acceptor {
             received_credentials: None,
             credentials_handled: false,
             received_auto_reconnect: None,
+            auto_reconnect_external: false,
             allow_unverified_credentials: false,
             reactivation: false,
             honor_client_desktop_size: None,
@@ -774,6 +778,7 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            auto_reconnect_external: consumed.auto_reconnect_external,
             allow_unverified_credentials: consumed.allow_unverified_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
@@ -860,6 +865,24 @@ impl Acceptor {
         self.received_auto_reconnect.is_some()
     }
 
+    /// An auto-reconnection that skips the credentials and the capability setup: the server
+    /// verifies the packet itself, unless it is the setup handler's.
+    pub(crate) fn auto_reconnect_skips_setup(&self) -> bool {
+        self.is_auto_reconnect_attempt() && !self.auto_reconnect_external
+    }
+
+    /// Auto-reconnection is the setup handler's: a client's packet is given to it
+    /// (`ConnectionSetupHandler::handle_client_auto_reconnect`), and the connection goes through
+    /// the credentials and the capability setup as any logon.
+    pub fn set_auto_reconnect_external(&mut self, external: bool) {
+        self.auto_reconnect_external = external;
+    }
+
+    /// The Client Auto-Reconnect Packet of the client's Info PDU, if it sent one (not verified).
+    pub fn received_auto_reconnect(&self) -> Option<&ClientAutoReconnect> {
+        self.received_auto_reconnect.as_ref()
+    }
+
     pub(crate) fn is_ready_for_capability_exchange(&self) -> bool {
         matches!(self.state, AcceptorState::CapabilitiesSendServer { .. })
     }
@@ -912,7 +935,7 @@ impl Acceptor {
     /// Whether credentials need handling after channel joins and ClientInfo.
     pub(crate) fn credentials_need_handling(&self) -> bool {
         matches!(self.state, AcceptorState::LicensingExchange { .. })
-            && !self.is_auto_reconnect_attempt()
+            && !self.auto_reconnect_skips_setup()
             && self.received_credentials.is_some()
             && !self.credentials_handled
     }
