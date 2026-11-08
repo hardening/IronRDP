@@ -1069,6 +1069,9 @@ const MAX_VIRTUAL_DESKTOP_DIMENSION: u32 = 32_766;
 #[derive(Default)]
 struct ResizeQueue {
     in_flight: Option<TimedResizeRequest>,
+    /// The session image's size when the in-flight request was sent: a server resizing through
+    /// the graphics pipeline (MS-RDPEDISP 3.2.5.1.1: `ResetGraphics`, no reactivation) changes it.
+    in_flight_from: Option<(u16, u16)>,
     pending: Option<TimedResizeRequest>,
 }
 
@@ -1089,7 +1092,15 @@ impl ResizeQueue {
         });
     }
 
-    fn mark_in_flight(&mut self, request: ResizeRequest) {
+    /// `request` was sent, `current` being the session image's size. A request for that size
+    /// has nothing to wait for: the server doesn't resize (a layout's other changes, such as the
+    /// scale, don't take a reactivation either).
+    fn mark_in_flight(&mut self, request: ResizeRequest, current: (u16, u16)) {
+        if (request.width, request.height) == current {
+            self.completed();
+            return;
+        }
+        self.in_flight_from = Some(current);
         self.in_flight = Some(TimedResizeRequest {
             request,
             deadline: tokio::time::Instant::now() + DISPLAY_CONTROL_READY_TIMEOUT,
@@ -1098,6 +1109,15 @@ impl ResizeQueue {
 
     fn completed(&mut self) {
         self.in_flight = None;
+        self.in_flight_from = None;
+    }
+
+    /// The session image is now `current`: a graphics reset at another size completes the
+    /// in-flight request, as a reactivation does.
+    fn image_resized(&mut self, current: (u16, u16)) {
+        if self.in_flight_from.is_some_and(|from| from != current) {
+            self.completed();
+        }
     }
 
     fn timed_out_request(&self, now: tokio::time::Instant) -> Option<(ResizeRequest, DisplayResizeFallbackReason)> {
@@ -4768,7 +4788,7 @@ async fn active_session(
                                 }
                                 dvc_batch => {
                                     let (width, height) = (request.width, request.height);
-                                    resize_queue.mark_in_flight(request);
+                                    resize_queue.mark_in_flight(request, (image.width(), image.height()));
                                     let mut outputs = Vec::new();
                                     if let Some(messages) = active_stage
                                         .get_svc_processor_mut::<RailClient>()
@@ -5861,6 +5881,8 @@ async fn active_session(
             ));
         }
 
+        // a server resizing through the graphics pipeline doesn't reactivate the session
+        resize_queue.image_resized((image.width(), image.height()));
         if resize_queue.in_flight.is_none()
             && let Some(pending) = resize_queue.pending.as_ref()
         {
@@ -5883,7 +5905,7 @@ async fn active_session(
                         batch => batch?,
                     };
                     resize_queue.pending = None;
-                    resize_queue.mark_in_flight(request);
+                    resize_queue.mark_in_flight(request, (image.width(), image.height()));
                     let channel_id = batch.channel_id();
                     let messages = batch.into_messages();
                     #[cfg(feature = "udp")]
@@ -6478,11 +6500,33 @@ mod tests {
     }
 
     #[test]
+    fn resize_queue_completes_on_a_graphics_reset() {
+        let mut queue = ResizeQueue::default();
+        queue.mark_in_flight(resize_request(1600, 900), (1024, 768));
+        assert!(queue.in_flight.is_some());
+        // frames at the former size: still waiting
+        queue.image_resized((1024, 768));
+        assert!(queue.in_flight.is_some());
+        // ResetGraphics: the image at the new size
+        queue.image_resized((1600, 900));
+        assert!(queue.in_flight.is_none());
+        assert_eq!(queue.deadline(), None);
+    }
+
+    #[test]
+    fn resize_queue_does_not_wait_for_the_current_size() {
+        let mut queue = ResizeQueue::default();
+        queue.mark_in_flight(resize_request(1024, 768), (1024, 768));
+        assert!(queue.in_flight.is_none());
+        assert_eq!(queue.deadline(), None);
+    }
+
+    #[test]
     fn resize_queue_coalesces_later_requests_until_reactivation() {
         let first = resize_request(1024, 768);
         let latest = resize_request(1600, 900);
         let mut queue = ResizeQueue::default();
-        queue.mark_in_flight(first);
+        queue.mark_in_flight(first, (800, 600));
         let deadline = queue.deadline().expect("in-flight resize must have a deadline");
         queue.defer(latest.clone());
 
